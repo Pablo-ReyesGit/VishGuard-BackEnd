@@ -1,0 +1,19 @@
+# Secretos y variables de entorno (NUNCA subir)
+.env
+*.env
+
+# Entornos virtuales y caché de Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Android Studio y Gradle
+.gradle/
+build/
+app/build/
+.idea/
+*.iml
+local.properties
+.cxx/
+
