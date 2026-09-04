@@ -30,12 +30,21 @@ def ejecutar_pruebas():
     print("==================================================\n")
 
     for caso in casos_de_prueba:
+<<<<<<< HEAD
         print(f"📌 Probando: {caso['id']}")
         print(f"💬 Texto: \"{caso['texto']}\"")
         
         resultado = analyzer.analizar_texto(caso['texto'])
         
         print("🤖 Respuesta JSON devuelta por Gemini Flash:")
+=======
+        print(f" Probando: {caso['id']}")
+        print(f" Texto: \"{caso['texto']}\"")
+        
+        resultado = analyzer.analizar_texto(caso['texto'])
+        
+        print(" Respuesta JSON devuelta por Gemini Flash:")
+>>>>>>> main
         print(json.dumps(resultado, indent=4, ensure_ascii=False))
         print("-" * 50 + "\n")
 

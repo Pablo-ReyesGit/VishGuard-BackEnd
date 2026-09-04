@@ -8,7 +8,11 @@ from modules.analyzer import VishingAnalyzer
 
 def probar_pipeline_completo():
     print("==================================================")
+<<<<<<< HEAD
     print(" 🛡️ INTEGRACIÓN STT + GEMINI FLASH (VISHGUARD AI)")
+=======
+    print("  (VISHGUARD AI)")
+>>>>>>> main
     print("==================================================\n")
 
     # 1. Inicializar Módulos
@@ -19,14 +23,22 @@ def probar_pipeline_completo():
     # (Para validar la tubería completa mientras probamos archivos .wav)
     audio_simulado = "Estimado cliente, su cuenta bancaria ha sido bloqueada. Por favor dicte el código de confirmación que le enviamos por SMS."
     
+<<<<<<< HEAD
     print(f"📥 Entrada de Audio (Simulado/Transcrito): \"{audio_simulado}\"\n")
+=======
+    print(f"Entrada de Audio (Simulado/Transcrito): \"{audio_simulado}\"\n")
+>>>>>>> main
     
     # 3. Analizar con Gemini Flash
     print("🔍 Analizando intención con Gemini Flash...")
     resultado = analyzer.analizar_texto(audio_simulado)
 
     # 4. Resultados visuales de alerta
+<<<<<<< HEAD
     print("\n🚨 RESULTADO DE LA EVALUACIÓN:")
+=======
+    print("\n RESULTADO DE LA EVALUACIÓN:")
+>>>>>>> main
     print(f"• Nivel de Riesgo : {resultado['nivel_riesgo']}")
     print(f"• Probabilidad    : {resultado['score']}%")
     print(f"• Patrones        : {', '.join(resultado['patrones_detectados'])}")
