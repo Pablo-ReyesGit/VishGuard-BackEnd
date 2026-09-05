@@ -1,9 +1,3 @@
-<<<<<<< HEAD
-.venv/
-__pycache__/
-.env
-*.db
-=======
 # Secretos y variables de entorno (NUNCA subir)
 .env
 *.env
@@ -15,16 +9,11 @@ __pycache__/
 *.pyc
 
 # Android Studio y Gradle
->>>>>>> main
 .gradle/
 build/
 app/build/
 .idea/
-<<<<<<< HEAD
-*.iml
-=======
 *.iml
 local.properties
 .cxx/
 
->>>>>>> main
