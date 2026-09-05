@@ -15,11 +15,26 @@ class VishingAnalyzer:
         if not self.client:
             return self._evaluacion_local(texto)
         try:
+            # 👈 Separar el rol 'system' del rol 'user' garantiza la estructura JSON
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": self._prompt(texto)}],
+                model="qwen/qwen3.6-27b",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Eres un sistema de ciberseguridad. Tu salida DEBE ser exclusivamente "
+                            "un objeto JSON válido sin texto adicional ni bloques Markdown."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": self._prompt(texto)
+                    }
+                ],
                 response_format={"type": "json_object"},
-                timeout=2.5,  # coincide con tu diagrama del circuit breaker
+                max_tokens=250,
+                temperature=0.1,
+                timeout=5.0,
             )
             return json.loads(response.choices[0].message.content)
         except Exception as e:
@@ -30,4 +45,20 @@ class VishingAnalyzer:
         return evaluar_amenaza_como_json(texto)
 
     def _prompt(self, texto: str) -> str:
-        return f"""Actúa como un experto en ciberseguridad..."""  # tu prompt actual
+        return f"""
+Analiza si la siguiente frase representa un intento de vishing (estafa telefónica).
+Responde en JSON con la siguiente estructura exacta:
+{{
+    "nivel_riesgo": "BAJO",
+    "score": 0,
+    "recomendacion": "Instrucción concisa",
+    "mensaje_alerta": "Resumen breve"
+}}
+
+Reglas:
+1. nivel_riesgo debe ser: "BAJO", "MEDIO" o "PELIGROSO".
+2. score debe ser un entero de 0 a 100.
+3. recomendacion y mensaje_alerta deben ser breves.
+
+Frase: "{texto}"
+"""

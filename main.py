@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # 👈 DEBE IR PRIMERO que las importaciones de api.routes
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db
