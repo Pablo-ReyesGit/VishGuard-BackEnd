@@ -23,14 +23,16 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 # SDK de Twilio para construir respuestas TwiML (XML especial para llamadas)
-from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.twiml.voice_response import VoiceResponse, Start, Dial
 
 # Importaciones de la arquitectura propia de VishGuard
 from database import SessionLocal, AlertHistory
 from modules.analyzer import VishingAnalyzer
+from core.connection_manager import manager
 
 # Inicialización del enrutador modular de FastAPI
 router = APIRouter()
+
 
 # Instancia del motor de análisis de fraudes (Groq LLM o motor heurístico de respaldo)
 analyzer = VishingAnalyzer()
@@ -39,42 +41,33 @@ analyzer = VishingAnalyzer()
 # ==============================================================================
 # PASO 1: WEBHOOK HTTP - RECEPCIÓN DE LA LLAMADA
 # ==============================================================================
+
 @router.post("/twilio/voice")
 async def twilio_voice_webhook(request: Request):
-    """
-    Endpoint HTTP invocado por Twilio inmediatamente cuando un usuario
-    llama al número asignado a VishGuard.
-    
-    Retorna un XML (TwiML) que le ordena a Twilio saludar al usuario y
-    abrir un WebSocket seguro hacia nuestro servidor.
-    """
-    # Extrae el dominio/host actual de la petición (ej. "a1b2.ngrok-free.app" o "api.vishguard.com")
     host = request.headers.get("host")
-    
-    # Determina si se debe usar WebSockets seguros (wss://) o simples (ws://).
-    # Si estamos corriendo mediante ngrok o detrás de HTTPS, usamos wss://.
     ws_protocol = "wss" if "ngrok" in host or request.headers.get("x-forwarded-proto") == "https" else "ws"
 
-    # Construye la respuesta en lenguaje TwiML de Twilio
+    numero_destino = "+50257008032"  # el celular real que debe sonar
+
     response = VoiceResponse()
-    
-    # 1. Reproduce un mensaje de voz sintética inicial para la persona que llama
-    response.say("Llamada conectada al sistema de protección VishGuard.", language="es-ES")
 
-    # 2. Instruye a Twilio a conectarse al WebSocket en tiempo real de nuestro backend
-    connect = Connect()
-    connect.stream(url=f"{ws_protocol}://{host}/ws/twilio")
-    response.append(connect)
+    # Inicia el streaming de audio SIN bloquear la llamada
+    start = Start()
+    start.stream(url=f"{ws_protocol}://{host}/ws/twilio?to={numero_destino}")
+    response.append(start)
 
-    # Devuelve la respuesta en formato XML requerida por las APIs de Twilio
+    # Reenvía la llamada real al teléfono del usuario
+    dial = Dial()
+    dial.number(numero_destino)
+    response.append(dial)
+
     return HTMLResponse(content=str(response), media_type="application/xml")
-
 
 # ==============================================================================
 # PASO 2: WEBSOCKET - PROCESAMIENTO DE AUDIO EN TIEMPO REAL
 # ==============================================================================
 @router.websocket("/ws/twilio")
-async def twilio_websocket_endpoint(websocket: WebSocket):
+async def twilio_websocket_endpoint(websocket: WebSocket, to: str):
     """
     Canal de comunicación continua de doble vía.
     Twilio transmite aquí el audio de la llamada dividida en pequeños 'chunks' (paquetes).
@@ -133,18 +126,19 @@ async def twilio_websocket_endpoint(websocket: WebSocket):
 
                     # Sub-paso B: Evaluación de Fraude/Vishing
                     # Se llama a VishingAnalyzer que internamente decidirá si usa Groq LLM o la Heurística local
-                    resultado = await analyzer.analizar_texto(texto_transcrito)
+                    resultado = analyzer.analizar_texto(texto_transcrito)
+                    await manager.enviar_a(to, resultado)
                     print(f"[VishGuard Analysis]: {resultado}")
 
                     # Sub-paso C: Persistencia en Base de Datos
                     # Si el nivel de amenaza detectado es riesgoso, se almacena en el historial
                     nivel = resultado.get("nivel_riesgo")
-                    if nivel in ["PATRONES_SEGUROS", "PATRONES_COMERCIAL", "PATRONES_INSTITUCIONES", "PATRONES_COACCION_URGENCIA", "PATRONES_CRITICOS_FRAUDE"]:
+                    if nivel in ["PELIGROSO", "FRAUDE", "MEDIO"]:
                         db = SessionLocal()  # Abre una sesión de base de datos
                         try:
                             # Crea el objeto según el ORM de SQLAlchemy definido en database.py
                             nueva_alerta = AlertHistory(
-                                texto=texto_transcrito,
+                                #texto=texto_transcrito,
                                 nivel_riesgo=nivel,
                                 score=resultado.get("score", 0),
                                 recomendacion=resultado.get("recomendacion", "")
@@ -157,7 +151,15 @@ async def twilio_websocket_endpoint(websocket: WebSocket):
             # EVENTO 3: El usuario o la centralita cuelgan la llamada
             elif event == "stop":
                 print("[Twilio WS] Transmisión de audio finalizada por Twilio.")
+                if len(audio_buffer) > 0:
+                    # procesar el remanente igual que el bloque de arriba (mismo sub-paso A/B/C)
+                    pass
                 break
 
     except WebSocketDisconnect:
         print("[Twilio WS] Conexión cerrada de forma abrupta por el cliente/Twilio.")
+
+@router.get("/debug/connections")
+def ver_conexiones():
+    from core.connection_manager import manager
+    return {"conectados": list(manager.active_connections.keys())}
