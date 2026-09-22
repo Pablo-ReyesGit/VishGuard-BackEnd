@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_main_gradient"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <!-- Encabezado / Título de la App -->
+    <TextView
+        android:id="@+id/tvTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:gravity="center"
+        android:text="🛡️ VishGuard AI"
+        android:textColor="#FFFFFF"
+        android:textSize="24sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvSubtitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="center"
+        android:text="Protección contra vishing en tiempo real"
+        android:textColor="#94A3B8"
+        android:textSize="14sp" />
+
+    <!-- Indicador de Estado del Servicio -->
+    <TextView
+        android:id="@+id/tvStatusInfo"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:gravity="center"
+        android:text="Estado: Desconectado"
+        android:textColor="#757575"
+        android:textSize="14sp"
+        android:textStyle="bold" />
+
+    <!-- Botón para Activar/Desactivar Protección Overlay -->
+    <Button
+        android:id="@+id/btnToggleService"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:layout_marginTop="12dp"
+        android:backgroundTint="#2E7D32"
+        android:text="ACTIVAR PROTECCIÓN"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        app:cornerRadius="8dp" />
+
+    <!-- Espaciador para no tapar el Overlay cuando esté activo arriba -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="100dp" />
+
+    <!-- Sección de Simulación -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:text="Simular Transcripción de Llamada:"
+        android:textColor="#E2E8F0"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
+    <!-- Input de texto para la simulación -->
+    <EditText
+        android:id="@+id/etFraseSimulada"
+        android:layout_width="match_parent"
+        android:layout_height="110dp"
+        android:background="#1E293B"
+        android:gravity="top|start"
+        android:hint="Escribe aquí la frase a analizar..."
+        android:padding="14dp"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#64748B"
+        android:textSize="14sp" />
+
+    <!-- Botón para Enviar y Analizar con IA -->
+    <Button
+        android:id="@+id/btnEnviarFrase"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:layout_marginTop="14dp"
+        android:backgroundTint="#0284C7"
+        android:text="ANALIZAR CON IA"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        app:cornerRadius="8dp" />
+
+</LinearLayout>
