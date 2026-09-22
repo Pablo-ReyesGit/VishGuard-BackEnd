@@ -1,35 +1,35 @@
 import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlmodel import SQLModel, create_engine, Session, Field
+from sqlalchemy.orm import sessionmaker
 
-# Base de datos SQLite local
-DATABASE_URL = "sqlite:///./vishguard.db"
+# 1. Importa el objeto 'settings' instanciado en core/config.py
+from core.config import settings
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# 2. Accede directamente al atributo DATABASE_URL del objeto 'settings'
+engine = create_engine(
+    str(settings.DATABASE_URL), 
+    echo=False
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
 
-# Modelo de la tabla de alertas
-class AlertHistory(Base):
-    __tablename__ = "alert_history"
 
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-    nivel_riesgo = Column(String(20), index=True)
-    score = Column(Integer)
-    patrones_detectados = Column(String(255))
-    frase_critica = Column(Text)
-    recomendacion = Column(Text)
+class AlertHistory(SQLModel, table=True):
+    __tablename__: str = "alert_history"
 
-# Inicializar tablas en la Base de Datos
-def init_db():
-    Base.metadata.create_all(bind=engine)  # <-- CORREGIDO: create_all en lugar de create_engine
+    id: int | None = Field(default=None, primary_key=True)
+    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
+    nivel_riesgo: str = Field(index=True, max_length=20)
+    score: int
+    patrones_detectados: str = Field(max_length=255)
+    frase_critica: str
+    recomendacion: str
+
+
+def init_db() -> None:
+    SQLModel.metadata.create_all(bind=engine)
+
 
 def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-        
+    with Session(engine) as session:
+        yield session
