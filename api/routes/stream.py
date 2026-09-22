@@ -23,15 +23,10 @@ def guardar_alerta_si_aplica(evaluacion: dict):
             db.close()
 
 @router.websocket("/ws/stream")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, numero: str):
+    await manager.connect(websocket, numero)
     try:
         while True:
-            mensaje = await websocket.receive_text()
-            if not mensaje.strip():
-                continue
-            evaluacion = analyzer.analizar_texto(mensaje)
-            guardar_alerta_si_aplica(evaluacion)
-            await websocket.send_json(evaluacion)
+            await websocket.receive_text()  # o simplemente mantener viva la conexión
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(numero)
