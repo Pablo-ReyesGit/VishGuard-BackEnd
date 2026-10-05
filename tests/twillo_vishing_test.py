@@ -56,6 +56,7 @@ from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 DESTINO = "+50257008032"
 DESTINO_URLENC = "%2B50257008032"
+LLAMANTE = "+50255551234"   # quien LLAMA (el `From` del webhook)
 CALL_SID = "CA1234567890"
 STREAM_SID = "MZ123"
 
@@ -165,16 +166,30 @@ class FakeSTT:
         self.behaviors: Dict[int, Any] = {}  # índice de llamada -> str | Exception
         self.default_text = "necesitamos su clave bancaria urgente"
         self.delay = 0.0
+        # Si se define, el texto depende del audio recibido (permite distinguir hablantes).
+        self.clasificar: Optional[Callable[[bytes], str]] = None
+        self.max_concurrentes = 0           # llamadas simultáneas observadas
+        self._activos = 0
+        self._cerrojo = threading.Lock()
 
     def __call__(self, pcm: bytes) -> str:
         idx = len(self.calls)
         self.calls.append(len(pcm))
-        if self.delay:
-            time.sleep(self.delay)
-        behavior = self.behaviors.get(idx, self.default_text)
-        if isinstance(behavior, Exception):
-            raise behavior
-        return behavior
+        with self._cerrojo:
+            self._activos += 1
+            self.max_concurrentes = max(self.max_concurrentes, self._activos)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if self.clasificar is not None:
+                return self.clasificar(pcm)
+            behavior = self.behaviors.get(idx, self.default_text)
+            if isinstance(behavior, Exception):
+                raise behavior
+            return behavior
+        finally:
+            with self._cerrojo:
+                self._activos -= 1
 
 
 class FakeAnalyzer:
@@ -319,30 +334,41 @@ def parse_twiml(response) -> ET.Element:
     return root
 
 
-def ev_start(destino: Optional[str] = DESTINO) -> dict:
+def ev_start(destino: Optional[str] = DESTINO, llamante: Optional[str] = None) -> dict:
     custom = {"to": destino} if destino else {}
+    if llamante:
+        custom["from"] = llamante
     return {
         "event": "start",
         "streamSid": STREAM_SID,
         "start": {
             "streamSid": STREAM_SID,
             "callSid": CALL_SID,
+            "tracks": ["inbound", "outbound"],
             "customParameters": custom,
             "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000},
         },
     }
 
 
-def ev_media() -> dict:
+def ev_media(pista: Optional[str] = None, ts_ms: Optional[int] = None, byte: int = 0xFF) -> dict:
+    """Frame de 20 ms. `pista` = "inbound"/"outbound" (None = sin campo, como una sola pista)."""
     import base64
 
-    payload = base64.b64encode(bytes([0xFF] * MULAW_BYTES_POR_FRAME)).decode()
-    return {"event": "media", "streamSid": STREAM_SID, "media": {"payload": payload}}
+    payload = base64.b64encode(bytes([byte] * MULAW_BYTES_POR_FRAME)).decode()
+    media: Dict[str, Any] = {"payload": payload}
+    if pista:
+        media["track"] = pista
+    if ts_ms is not None:
+        media["timestamp"] = str(ts_ms)
+    return {"event": "media", "streamSid": STREAM_SID, "media": media}
 
 
-def send_audio(ws, frames: int) -> None:
-    for _ in range(frames):
-        ws.send_json(ev_media())
+def send_audio(ws, frames: int, pista: Optional[str] = None,
+               inicio_ms: Optional[int] = None, byte: int = 0xFF) -> None:
+    for i in range(frames):
+        ts = None if inicio_ms is None else inicio_ms + 20 * i
+        ws.send_json(ev_media(pista, ts, byte))
 
 
 def finish_call(ws) -> None:
@@ -401,11 +427,10 @@ def test_tc_auto_011_voice_webhook_returns_valid_twiml(client):
     stream = root.find("Start/Stream")
     assert stream is not None
     assert stream.attrib["url"] == "ws://testserver/ws/twilio"
-    assert stream.attrib.get("track") == "inbound_track"
+    assert stream.attrib.get("track") == "both_tracks"   # ambos lados de la conversación
 
-    parametro = stream.find("Parameter")
-    assert parametro is not None
-    assert parametro.attrib == {"name": "to", "value": DESTINO}
+    parametros = {p.attrib["name"]: p.attrib["value"] for p in stream.findall("Parameter")}
+    assert parametros == {"to": DESTINO, "from": LLAMANTE}   # receptor y llamante
 
     dial = root.find("Dial")
     assert dial.attrib.get("answerOnBridge", "").lower() == "true"
@@ -1157,6 +1182,410 @@ def test_manager_enviar_a_dead_socket_returns_false_and_is_removed(cm_mod):
 
     assert asyncio.run(escenario()) is False
     assert DESTINO not in manager.active_connections
+
+
+# ============================================================================
+# GRABACIÓN OPCIONAL DEL AUDIO (WAV) Y PUNTOS DE EXTENSIÓN
+# ============================================================================
+
+import re  # noqa: E402
+import wave  # noqa: E402
+
+
+@pytest.fixture
+def grabar(monkeypatch, tmp_path):
+    """Activa la grabación WAV en una carpeta temporal y devuelve esa carpeta."""
+    carpeta = tmp_path / "rec"
+    monkeypatch.setenv("VISHGUARD_GUARDAR_WAV", "1")
+    monkeypatch.setenv("VISHGUARD_WAV_DIR", str(carpeta))
+    return carpeta
+
+
+def leer_wav(ruta):
+    with wave.open(str(ruta), "rb") as w:
+        n = w.getnframes()
+        return SimpleNamespace(
+            canales=w.getnchannels(),
+            ancho=w.getsampwidth(),
+            hz=w.getframerate(),
+            frames=n,
+            datos=w.readframes(n),
+        )
+
+
+def canales_wav(datos: bytes):
+    """Separa un WAV estéreo de 16 bits en (canal izquierdo, canal derecho)."""
+    import audioop
+
+    return audioop.tomono(datos, 2, 1, 0), audioop.tomono(datos, 2, 0, 1)
+
+
+def frames_si_valido(ruta):
+    """Muestras del WAV, o None si el archivo aún no está cerrado/legible."""
+    try:
+        return leer_wav(ruta).frames
+    except (wave.Error, EOFError, OSError):
+        return None
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_is_disabled_by_default_and_creates_nothing(client, fakes, fake_manager, monkeypatch, tmp_path):
+    carpeta = tmp_path / "rec"
+    monkeypatch.delenv("VISHGUARD_GUARDAR_WAV", raising=False)
+    monkeypatch.setenv("VISHGUARD_WAV_DIR", str(carpeta))
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert not carpeta.exists()
+    assert fakes.stt.calls == [CHUNK_BYTES]
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_is_saved_with_the_pipeline_format(client, fakes, fake_manager, grabar):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    archivos = list(grabar.glob("*.wav"))
+    assert len(archivos) == 1
+    assert archivos[0].name.startswith(CALL_SID + "_")
+
+    wav = leer_wav(archivos[0])
+    assert (wav.canales, wav.ancho, wav.hz) == (2, 2, 8000)       # PCM16 estéreo 8 kHz
+    assert wav.frames == FRAMES_3S * MULAW_BYTES_POR_FRAME        # 24,000 muestras = 3 s
+    assert fakes.stt.calls == [CHUNK_BYTES]                       # grabar no altera la canalización
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_content_equals_the_decoded_audio(client, fakes, fake_manager, grabar):
+    import audioop
+    import base64
+
+    mulaw = bytes([0x10, 0x30, 0x50, 0x70] * 40)  # 160 bytes con señal (no silencio)
+    payload = base64.b64encode(mulaw).decode()
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        for _ in range(5):
+            ws.send_json({"event": "media", "media": {"payload": payload}})
+        finish_call(ws)
+
+    archivo = next(grabar.glob("*.wav"))
+    izq, der = canales_wav(leer_wav(archivo).datos)
+    assert izq == audioop.ulaw2lin(mulaw, 2) * 5      # sin `track`: se asume el llamante (canal izquierdo)
+    assert der == bytes(len(izq))                     # nadie habló por el canal derecho
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+@pytest.mark.security
+def test_wav_filename_is_sanitized_against_path_traversal(client, fakes, fake_manager, grabar, tmp_path):
+    inicio = ev_start()
+    inicio["start"]["callSid"] = "../../evil"
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(inicio)
+        send_audio(ws, 5)
+        finish_call(ws)
+
+    archivos = list(tmp_path.rglob("*.wav"))
+    assert len(archivos) == 1
+    assert archivos[0].parent == grabar                        # no escapó de la carpeta
+    assert re.fullmatch(r"evil_\d{8}_\d{6}\.wav", archivos[0].name)
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_skips_invalid_base64_frames(client, fakes, fake_manager, grabar):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        ws.send_json({"event": "media", "media": {"payload": "%%%NO_BASE64%%%"}})
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert leer_wav(next(grabar.glob("*.wav"))).frames == FRAMES_3S * MULAW_BYTES_POR_FRAME
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_is_valid_after_an_abrupt_hangup(client, fakes, fake_manager, grabar):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, 50)
+        # sin `stop`: el WAV debe cerrarse igual y quedar legible
+
+    esperado = 50 * MULAW_BYTES_POR_FRAME
+    assert wait_until(lambda: any(frames_si_valido(p) == esperado for p in grabar.glob("*.wav")))
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_failure_never_interrupts_the_call(client, fakes, fake_manager, monkeypatch, tmp_path):
+    no_es_carpeta = tmp_path / "no_es_carpeta"
+    no_es_carpeta.write_text("x")                              # un archivo donde debería ir la carpeta
+    monkeypatch.setenv("VISHGUARD_GUARDAR_WAV", "1")
+    monkeypatch.setenv("VISHGUARD_WAV_DIR", str(no_es_carpeta))
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert fakes.stt.calls == [CHUNK_BYTES]                    # la llamada se procesó igual
+    assert len(fake_manager.sent) == 1
+    assert no_es_carpeta.read_text() == "x"
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_cap_stops_recording_but_not_the_analysis(client, fakes, fake_manager, grabar, monkeypatch, twilio_stream_mod):
+    monkeypatch.setattr(twilio_stream_mod, "WAV_MAX_BYTES", 16_000)  # 1 s
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert leer_wav(next(grabar.glob("*.wav"))).frames == 8_000      # solo 1 s grabado
+    assert fakes.stt.calls == [CHUNK_BYTES]                          # el análisis recibió los 3 s
+
+
+@pytest.mark.unit
+def test_recorder_disabled_is_a_safe_noop(twilio_stream_mod, monkeypatch):
+    monkeypatch.delenv("VISHGUARD_GUARDAR_WAV", raising=False)
+    grabador = twilio_stream_mod.GrabadorWav("CA1")
+    grabador.escribir("inbound", b"\x00" * 320, 0)
+    grabador.cerrar()
+    grabador.cerrar()
+    assert grabador.ruta is None
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_analysis_stage_is_a_single_replaceable_seam(client, fakes, fake_manager, monkeypatch, twilio_stream_mod):
+    """Contrato para añadir después un interruptor del análisis: basta con
+    sustituir `_etapa_analisis`; transcripción, notificación y el resto no cambian."""
+
+    async def neutro(texto: str) -> dict:
+        return {"nivel_riesgo": "BAJO", "score": 0, "texto": texto}
+
+    monkeypatch.setattr(twilio_stream_mod, "_etapa_analisis", neutro)
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert fakes.analyzer.calls == []                                # el analizador no se tocó
+    assert fake_manager.sent[0][1]["texto"] == fakes.stt.default_text
+
+
+# ============================================================================
+# CONVERSACIÓN COMPLETA: AMBOS LADOS (both_tracks), CADA MENSAJE IDENTIFICADO
+# ============================================================================
+# inbound  = quien LLAMA   -> hablante "llamante"
+# outbound = quien RECIBE  -> hablante "receptor"
+
+BYTE_LLAMANTE = 0x10   # "voz" sintética del llamante (no es silencio)
+BYTE_RECEPTOR = 0x90   # "voz" sintética del receptor (decodifica a un valor distinto)
+
+
+def decodificado(byte: int, frames: int) -> bytes:
+    """PCM16 que debe resultar de `frames` frames mu-law con ese byte."""
+    import audioop
+
+    return audioop.ulaw2lin(bytes([byte] * MULAW_BYTES_POR_FRAME), 2) * frames
+
+
+def quien_habla(pcm: bytes) -> str:
+    """Texto de prueba según el audio recibido: distingue a cada hablante."""
+    voz = decodificado(BYTE_LLAMANTE, 1)[:2]
+    return "habla el llamante" if pcm[:2] == voz else "habla el receptor"
+
+
+def send_conversacion(ws, frames: int, ini_llamante: int = 0, ini_receptor: int = 0) -> None:
+    """Intercala los frames de ambos lados, como los envía Twilio con both_tracks."""
+    for i in range(frames):
+        ws.send_json(ev_media("inbound", ini_llamante + 20 * i, BYTE_LLAMANTE))
+        ws.send_json(ev_media("outbound", ini_receptor + 20 * i, BYTE_RECEPTOR))
+
+
+@pytest.mark.integration
+@pytest.mark.twilio
+def test_twiml_without_caller_number_only_sends_the_receiver_parameter(client):
+    """Sin `From` (p. ej. al probar desde Swagger) no se envía el parámetro `from`."""
+    response = client.post(VOICE_ENDPOINT)
+    assert response.status_code == 200
+    stream = parse_twiml(response).find("Start/Stream")
+    assert {p.attrib["name"] for p in stream.findall("Parameter")} == {"to"}
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_both_tracks_are_transcribed_and_labeled_by_speaker(client, fakes, fake_manager):
+    fakes.stt.clasificar = quien_habla
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start(llamante=LLAMANTE))
+        send_conversacion(ws, FRAMES_3S, ini_llamante=100, ini_receptor=220)
+        finish_call(ws)
+
+    assert fakes.stt.calls == [CHUNK_BYTES, CHUNK_BYTES]            # un bloque por hablante
+    assert all(numero == DESTINO for numero, _ in fake_manager.sent)
+    mensajes = {m["hablante"]: m for _, m in fake_manager.sent}
+    assert set(mensajes) == {"llamante", "receptor"}
+    assert mensajes["llamante"]["texto"] == "habla el llamante"
+    assert mensajes["receptor"]["texto"] == "habla el receptor"
+    assert mensajes["llamante"]["inicio_ms"] == 100                 # primer frame de su bloque
+    assert mensajes["receptor"]["inicio_ms"] == 220
+    assert mensajes["llamante"]["nivel_riesgo"] == "PELIGROSO"      # el resultado del analizador se conserva
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_track_field_missing_is_treated_as_the_caller(client, fakes, fake_manager):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S)  # frames sin campo `track`
+        finish_call(ws)
+
+    assert [m["hablante"] for _, m in fake_manager.sent] == ["llamante"]
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_unknown_track_is_ignored(client, fakes, fake_manager):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, FRAMES_3S, pista="otra_pista")
+        finish_call(ws)
+
+    assert fakes.stt.calls == []
+    assert fake_manager.sent == []
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_each_speaker_has_its_own_buffer_and_remainder(client, fakes, fake_manager):
+    fakes.stt.clasificar = quien_habla
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, 100, "inbound", 0, BYTE_LLAMANTE)     # 32,000 bytes
+        send_audio(ws, 60, "outbound", 0, BYTE_RECEPTOR)     # 19,200 bytes
+        finish_call(ws)
+
+    assert sorted(fakes.stt.calls) == [60 * PCM_BYTES_POR_FRAME, 100 * PCM_BYTES_POR_FRAME]
+    assert {m["hablante"] for _, m in fake_manager.sent} == {"llamante", "receptor"}
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_a_short_remainder_of_one_speaker_does_not_affect_the_other(client, fakes, fake_manager):
+    fakes.stt.clasificar = quien_habla
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, 100, "inbound", 0, BYTE_LLAMANTE)
+        send_audio(ws, 10, "outbound", 0, BYTE_RECEPTOR)     # 3,200 bytes: bajo el mínimo (0.5 s)
+        finish_call(ws)
+
+    assert fakes.stt.calls == [100 * PCM_BYTES_POR_FRAME]
+    assert [m["hablante"] for _, m in fake_manager.sent] == ["llamante"]
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_speakers_are_processed_in_parallel_not_one_after_the_other(client, fakes, fake_manager):
+    """Con un solo lock, dos hablantes con un STT lento acumularían retraso."""
+    fakes.stt.delay = 0.3
+    fakes.stt.clasificar = quien_habla
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_conversacion(ws, FRAMES_3S)
+        finish_call(ws)
+
+    assert fakes.stt.max_concurrentes == 2
+    assert len(fake_manager.sent) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_has_one_channel_per_speaker(client, fakes, fake_manager, grabar):
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start(llamante=LLAMANTE))
+        send_conversacion(ws, 50)
+        finish_call(ws)
+
+    wav = leer_wav(next(grabar.glob("*.wav")))
+    assert (wav.canales, wav.ancho, wav.hz) == (2, 2, 8000)
+    izq, der = canales_wav(wav.datos)
+    assert izq == decodificado(BYTE_LLAMANTE, 50)     # canal izquierdo = llamante
+    assert der == decodificado(BYTE_RECEPTOR, 50)     # canal derecho  = receptor
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_aligns_both_speakers_by_timestamp(client, fakes, fake_manager, grabar):
+    """El receptor contesta 1 s después: su canal arranca con 1 s de silencio."""
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_audio(ws, 100, "inbound", 0, BYTE_LLAMANTE)       # 0 s -> 2 s
+        send_audio(ws, 50, "outbound", 1000, BYTE_RECEPTOR)    # 1 s -> 2 s
+        finish_call(ws)
+
+    wav = leer_wav(next(grabar.glob("*.wav")))
+    assert wav.frames == 16_000                                # 2 s en total
+    izq, der = canales_wav(wav.datos)
+    assert izq == decodificado(BYTE_LLAMANTE, 100)
+    assert der[:16_000] == bytes(16_000)                       # 1 s de silencio...
+    assert der[16_000:] == decodificado(BYTE_RECEPTOR, 50)     # ...y luego su voz
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_wav_mono_mode_mixes_both_speakers(client, fakes, fake_manager, grabar, monkeypatch):
+    import audioop
+
+    monkeypatch.setenv("VISHGUARD_WAV_MODO", "mono")
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_conversacion(ws, 10)
+        finish_call(ws)
+
+    wav = leer_wav(next(grabar.glob("*.wav")))
+    esperado = audioop.add(
+        audioop.mul(decodificado(BYTE_LLAMANTE, 10), 2, 0.5),
+        audioop.mul(decodificado(BYTE_RECEPTOR, 10), 2, 0.5),
+        2,
+    )
+    assert (wav.canales, wav.hz) == (1, 8000)
+    assert wav.datos == esperado
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+@pytest.mark.security
+def test_absurd_timestamp_cannot_make_the_recorder_reserve_memory(client, fakes, fake_manager, grabar):
+    """El timestamp llega por un WebSocket sin autenticar: no puede inflar la grabación."""
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        ws.send_json(ev_media("inbound", 10**9, BYTE_LLAMANTE))   # ~16 GB de silencio si se rellenara
+        send_audio(ws, FRAMES_3S - 1, "inbound", 20, BYTE_LLAMANTE)
+        finish_call(ws)
+
+    assert fakes.stt.calls == [CHUNK_BYTES]                       # la llamada se procesa igual
+    assert next(grabar.glob("*.wav")).stat().st_size < 100_000    # y la grabación se detuvo
+
+
+@pytest.mark.unit
+def test_recorder_ignores_unknown_tracks_and_bad_timestamps(twilio_stream_mod, grabar):
+    grabador = twilio_stream_mod.GrabadorWav("CAx")
+    grabador.escribir("pista_rara", b"\x01\x02" * 160, 0)       # pista desconocida: se ignora
+    grabador.escribir("inbound", b"\x01\x00" * 160, -5)         # timestamp negativo: se añade sin rellenar
+    grabador.cerrar()
+    grabador.cerrar()                                            # cerrar dos veces es inocuo
+
+    wav = leer_wav(next(grabar.glob("*.wav")))
+    assert wav.frames == 160
 
 
 # ============================================================================

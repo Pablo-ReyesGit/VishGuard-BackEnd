@@ -67,6 +67,10 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `GROQ_STT_MODEL` | Opcional | Por defecto `whisper-large-v3-turbo` |
 | `WS_AUTH_REQUIRED` | `true` para exigir JWT en `/ws/stream` | Opcional; la app debe enviar `?token=<JWT>` |
 | `VISHGUARD_DEBUG` | `1` | Expone `/debug/connections` (números enmascarados) |
+| `VISHGUARD_GUARDAR_WAV` | `1` para activar | Guarda el audio de cada llamada en un `.wav` (apagado por defecto) |
+| `VISHGUARD_WAV_DIR` | Opcional | Carpeta de las grabaciones; por defecto `grabaciones`, relativa a la carpeta desde donde arrancas uvicorn |
+| `VISHGUARD_WAV_MAX_SEG` | Opcional | Tope de segundos grabados por llamada y por hablante; por defecto 600 |
+| `VISHGUARD_WAV_MODO` | `estereo` (defecto) o `mono` | `estereo`: canal izquierdo = llamante, derecho = receptor. `mono` mezcla a ambos en un solo canal |
 
 ## Fase 1. Pruebas con Swagger
 
@@ -84,28 +88,39 @@ Desde PowerShell puedes repetir la prueba 1 con `curl.exe -X POST http://127.0.0
 
 ## Fase 2. Simulador de Twilio y de la app
 
-El archivo `tests/simular_twilio.py` hace de app Android (se conecta a `/ws/stream`) y de Twilio (envía `connected`, `start` con `customParameters`, frames `media` a ritmo real y `stop`). Con el backend corriendo y `VISHGUARD_STT=simulado`:
+El archivo `tests/simular_twilio.py` hace de app Android (se conecta a `/ws/stream`) y de Twilio con **los dos lados de la llamada**: envía `connected`, `start` (con los parámetros `to` y `from`), frames `media` de la pista `inbound` (el llamante, un tono de 440 Hz) y de la pista `outbound` (el receptor, un tono de 880 Hz que empieza cuando "contesta"), y `stop`, todo a ritmo real y con `timestamp`. Con el backend corriendo y `VISHGUARD_STT=simulado`:
 
 ```powershell
-python tests\simular_twilio.py --numero +502XXXXXXXX --segundos 7
+python tests\simular_twilio.py --numero +502XXXXXXXX --segundos 8 --receptor-despues 1
 ```
 
 Salida esperada, validada contra un servidor real:
 
 ```
-[APP]    conectada a /ws/stream
-[TWILIO] conectado a /ws/twilio
-[TWILIO] start enviado (to=+502...); enviando 7 s de audio...
-[APP]    ALERTA #1: nivel=... score=...
-[APP]    ALERTA #2: ...
-[TWILIO] stop enviado
-[APP]    ALERTA #3: ...
-RESULTADO: OK, la app recibió 3 alerta(s).
+[APP]    #1 LLAMANTE  @  0.0 s nivel=... score=...
+[APP]    #2 RECEPTOR  @  1.0 s nivel=... score=...
+[APP]    #3 LLAMANTE  @  3.0 s ...
+[APP]    #4 RECEPTOR  @  4.0 s ...
+[APP]    #5 LLAMANTE  @  6.0 s ...
+[APP]    #6 RECEPTOR  @  7.0 s ...
+RESUMEN: {'llamante': 3, 'receptor': 3}
+RESULTADO: OK, la app recibió mensajes de llamante y receptor.
 ```
 
-Salen 3 alertas porque 7 s son dos bloques de 3 s más un remanente de 1 s (se procesa al recibir `stop`). En la consola de uvicorn deben aparecer `Conexión WebSocket establecida con Twilio`, `Stream iniciado (callSid=CA_SIMULADO, destino=***XXXX)`, un `[VishGuard] riesgo=…` por alerta y `Transmisión finalizada por Twilio`.
+Salen 3 mensajes por hablante porque 8 s son dos bloques de 3 s más un remanente. Cada hablante se procesa por separado y el momento `@` es el instante de su primer frame, de modo que el receptor aparece a partir del segundo en que contestó. En la consola de uvicorn debe aparecer `Stream iniciado (callSid=CA_SIMULADO, llamante=***1234, receptor=***XXXX, pistas=['inbound', 'outbound'])`, un `[VishGuard] llamante ...` o `[VishGuard] receptor ...` por mensaje y `Transmisión finalizada por Twilio`.
 
-Variantes útiles: `--url wss://xxxx.ngrok-free.app` (probar a través de ngrok), `--prefijo /api/v1` si incluyes los routers con prefijo, `--token <JWT>` si activas `WS_AUTH_REQUIRED`. Con `VISHGUARD_STT=groq` el simulador manda silencio, que se descarta: para probar Groq usa una llamada real.
+Variantes útiles:
+
+| Opción | Para qué sirve |
+| --- | --- |
+| `--receptor-despues 3` | El receptor contesta a los 3 s |
+| `--solo-llamante` | Simula un stream de una sola pista (solo llega el llamante) |
+| `--silencio` | Envía silencio en lugar de tonos |
+| `--url wss://xxxx.ngrok-free.app` | Probar a través de ngrok |
+| `--prefijo /api/v1` | Si incluyes los routers con prefijo |
+| `--token <JWT>` | Si activas `WS_AUTH_REQUIRED` |
+
+Con `VISHGUARD_STT=groq` los tonos no son voz y no se transcriben: para probar Groq usa una llamada real.
 
 ## Fase 3. URL pública con ngrok
 
@@ -168,11 +183,71 @@ Antes de llamar, comprueba que uvicorn y ngrok estén activos, que la app (o el 
 1. Llama a tu número de Twilio desde otro teléfono.
 2. **Inspector de ngrok (4040):** debe aparecer `POST /twilio/voice` con respuesta 200.
 3. **Tu celular** (el de `VISHGUARD_DESTINO`) suena; al contestar queda conectada la llamada.
-4. **Consola de uvicorn:** `Stream iniciado (callSid=CA…, destino=***XXXX)` y, cada \~3 s de audio, `[VishGuard] riesgo=… score=…`.
-5. **La app** recibe una alerta por cada bloque analizado.
+4. **Consola de uvicorn:** `Stream iniciado (callSid=CA…, llamante=***XXXX, receptor=***XXXX, pistas=['inbound', 'outbound'])` y, cada \~3 s de audio de cada hablante, `[VishGuard] llamante …` o `[VishGuard] receptor …`.
+5. **La app** recibe un mensaje por cada bloque analizado, con los campos `hablante` (`llamante` o `receptor`), `texto` (lo transcrito) e `inicio_ms` (milisegundos desde el inicio de la llamada, para ordenar la conversación).
 6. Al colgar: `Transmisión finalizada por Twilio`.
 
-Con `VISHGUARD_STT=simulado` la alerta llega cada 3 s con el texto fijo, sin importar lo que se hable, y no se guarda en la base de datos. Si la llamada falla, abre los registros de llamadas y el depurador de Twilio (en la Legacy Console están bajo **Monitor → Logs**) y busca la llamada por su hora.
+Con `VISHGUARD_STT=simulado` llega un mensaje cada 3 s por hablante con el texto fijo, sin importar lo que se hable, y no se guarda en la base de datos. Si la llamada falla, abre los registros de llamadas y el depurador de Twilio (en la Legacy Console están bajo **Monitor → Logs**) y busca la llamada por su hora.
+
+## Fase 5b. Verificar el audio de la conversación completa
+
+Los logs prueban que llegan datos al ritmo correcto, pero no que sean voz. Para comprobarlo, activa la grabación **antes de arrancar uvicorn**:
+
+```powershell
+$env:VISHGUARD_GUARDAR_WAV = "1"
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Haz una llamada y, al colgar, busca el archivo en la carpeta `grabaciones\` (dentro de la carpeta desde la que ejecutaste uvicorn). El nombre es `<CallSid>_<fecha>_<hora>.wav`. En el log verás `Grabando la conversación en ...` al empezar y `Grabación guardada: ... (N s)` al terminar.
+
+**Cómo está grabada la conversación:**
+
+- **Quien llama va en el canal izquierdo y quien recibe en el derecho.** Es el formato de grabación de llamadas con un canal por persona: con parlantes oyes a los dos, y con audífonos cada voz sale por un oído. Para una mezcla en un solo canal usa `$env:VISHGUARD_WAV_MODO = "mono"`.
+- **Los turnos están alineados en el tiempo.** Cada frame se coloca según su `timestamp`, así que si el receptor contesta 5 s después, su canal arranca con 5 s de silencio y no se desfasa de la conversación.
+- **Formato:** PCM de 16 bits y 8 kHz. Cada canal es exactamente el audio que entra a `transcribir_audio` para ese hablante, por lo que es la muestra ideal para el equipo de Whisper (un canal = una persona, sin tener que separar voces).
+
+**Qué comprobar al escucharlo:**
+
+1. Se oye la voz de quien llama por un lado y la de quien contesta por el otro.
+2. **Revisa el canal derecho antes de que contestes.** Según la documentación de Twilio, la pista `outbound` es el audio que Twilio genera hacia la llamada, e incluye el del tramo hijo del `<Dial>` (tu voz), pero también puede traer música en espera. Si oyes el tono de llamada en ese canal, tu transcriptor recibirá ese ruido y conviene filtrarlo.
+3. Si un canal está en silencio total, mira el log: la línea `Stream iniciado` debe mostrar `pistas=['inbound', 'outbound']`. Si solo aparece `inbound`, Twilio no está enviando la pista del receptor.
+
+**Detalles de seguridad:**
+
+- **Las grabaciones contienen voz de personas.** Graba solo llamadas de prueba propias o con consentimiento, y borra los archivos al terminar.
+- **Agrega `grabaciones/` a tu `.gitignore`** para no subirlas al repositorio.
+- La grabación **nunca interrumpe la llamada**: si falla el disco o se llega al tope de duración, se detiene y deja un aviso en el log.
+- El `timestamp` llega por un WebSocket sin autenticar, por lo que se comprueba el tope antes de rellenar silencios: un valor absurdo no puede reservar memoria.
+
+### Contrato de entrega para Whisper
+
+El equipo de Whisper solo tiene que sustituir el cuerpo de `transcribir_audio(pcm8k: bytes) -> str` en `twilio_stream.py`:
+
+- **Entrada:** PCM de 16 bits, mono, 8 kHz, en bloques de 3 s (48,000 bytes) **de un solo hablante**. Cada hablante tiene su propio bloque, así que no hace falta separar voces. Con un canal del WAV grabado puedes simular esa entrada.
+- **Conversión:** `_a_wav_16k(pcm8k)` ya devuelve el WAV a 16 kHz que Whisper espera.
+- **Salida:** el texto transcrito. Si devuelve una cadena vacía, el bloque se descarta sin pasar al análisis.
+- La función no recibe quién habla: el backend etiqueta el mensaje después, a partir de la pista de la que vino el audio.
+- Esa función corre en un hilo aparte (`asyncio.to_thread`), así que puede bloquear sin frenar el audio. Los dos hablantes se procesan **en paralelo**.
+
+### Mensaje que recibe la app
+
+A cada mensaje del analizador se le añaden tres campos: `hablante` (`llamante` o `receptor`), `texto` y `inicio_ms`. Si el parser de la app es estricto con los campos desconocidos, añádelos como opcionales en tu clase de respuesta (`VishingResponse.kt`), por ejemplo `val hablante: String? = null`, `val texto: String? = null` y `val inicioMs: Long? = null` (con `@SerializedName("inicio_ms")` si usas Gson).
+
+### Cómo añadir después el interruptor del analizador
+
+Hoy no existe, pero el análisis está aislado en una sola función (`_etapa_analisis`), de modo que añadirlo después son tres líneas en `twilio_stream.py`:
+
+```python
+# junto a STT_MODE
+ANALIZAR = os.getenv("VISHGUARD_ANALIZAR", "1").lower() in ("1", "true", "yes")
+
+async def _etapa_analisis(texto: str) -> dict:
+    if not ANALIZAR:
+        return {"nivel_riesgo": "BAJO", "score": 0, "texto": texto}  # no llama a la IA
+    return await asyncio.to_thread(analyzer.analizar_texto, texto)
+```
+
+Con `VISHGUARD_ANALIZAR=0` el resultado neutro sigue llegando a la app y no se guarda en la base de datos, porque el nivel `BAJO` no se persiste. La suite ya incluye una prueba que sustituye esa función, y demuestra que el resto de la canalización no cambia.
 
 ## Fase 6. Groq real y base de datos
 
@@ -207,6 +282,11 @@ En la URL el `+` debe ir como `%2B`. El backend normaliza el número (acepta esp
 | Con `groq` no llegan alertas hablando en silencio | El silencio se descarta | Habla durante la llamada |
 | La URL de ngrok cambió | Dominio temporal | Actualiza `PUBLIC_URL`, reinicia uvicorn y actualiza el webhook de Twilio |
 | La llamada se corta a los 10 minutos | Límite de Trial | Hacer upgrade |
+| Solo llegan mensajes del llamante | Twilio no envía la pista `outbound` | Mira `pistas=` en la línea `Stream iniciado`; la pista del receptor solo fluye cuando el `<Dial>` conecta. Confirma que el webhook de Twilio sea el nuevo (`both_tracks`) y reinicia uvicorn |
+| El WAV tiene un canal en silencio | Esa persona no habló o su pista no llegó | Escucha cada canal por separado y revisa `pistas=` en el log |
+| Llegan mensajes del receptor antes de que conteste | La pista `outbound` incluye tono de llamada o música en espera | Es audio de Twilio, no una persona: hay que filtrarlo (por ejemplo, ignorar la pista hasta que el receptor conteste) |
+| No aparece la carpeta `grabaciones` | La variable se definió después de arrancar uvicorn, o lo ejecutaste desde otra carpeta | Define `VISHGUARD_GUARDAR_WAV=1` antes de arrancar; la ruta es relativa a la carpeta actual (o fija `VISHGUARD_WAV_DIR`) |
+| El log muestra `Groq 401 Invalid API Key` | Clave del analizador (`chat/completions`) inválida; no es de Whisper | No afecta a la recepción de llamadas: el analizador cae al heurístico local. Quien lo mantenga debe renovar la clave |
 
 ## Al terminar
 
@@ -218,5 +298,7 @@ Cierra ngrok y, si ya no usarás el número, libéralo para no pagar la renta me
 - La disponibilidad de números con voz en Guatemala y si piden *compliance profile*. Verifícalo en la pantalla de compra.
 - El depósito mínimo vigente del upgrade.
 - Si la opción **Custom** del panel *Try out Voice* del Trial permite pegar tu propia URL de webhook.
+- Cuánto audio genera la pista `outbound` antes de que el receptor conteste (tono de llamada o silencio). Se comprueba escuchando el canal derecho del WAV de una llamada real.
+- Si `both_tracks` cuenta como dos streams en la facturación de Media Streams. Revísalo en la página de precios de Twilio.
 
 Fuentes: [Respond to incoming calls](https://www.twilio.com/docs/voice/tutorials/how-to-respond-to-incoming-phone-calls), [TwiML `<Stream>`](https://www.twilio.com/docs/voice/twiml/stream), [Trial account](https://www.twilio.com/docs/usage/trials), [Try out Voice (verbos bloqueados)](https://www.twilio.com/docs/usage/trials/try-out-voice).
