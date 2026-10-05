@@ -1,32 +1,22 @@
 from dotenv import load_dotenv
-load_dotenv()  # 👈 DEBE IR PRIMERO que las importaciones de api.routes
 
-from contextlib import asynccontextmanager
+load_dotenv()  # Carga variables (.env) antes de importar submódulos
+
+from api.routes import alerts, analysis, health, stream
+from database import init_db
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel
 
-from database import engine, init_db
-from api.routes import health, alerts, stream, analysis, twilio_stream, login, users
+# Inicialización de la base de datos local (SQLite/PostgreSQL)
+init_db()
 
-# Importante: importar modelos para que SQLModel registre la tabla 'User'
-import models 
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Inicializa y crea todas las tablas en Neon/Postgres al arrancar
-    init_db()
-    yield
-
-
-# Instanciación ÚNICA pasando el lifespan
 app = FastAPI(
     title="VishGuard AI - Calibrated Detection Engine",
-    lifespan=lifespan
+    description="Motor en tiempo real para detección de Vishing mediante Groq Whisper y LLaMA",
+    version="1.0.0",
 )
 
-# Configuración de CORS
+# Configuración de permisos CORS para comunicación fluida con Android
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,16 +25,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inclusión de routers
+# Inclusión de Routers HTTP y WebSocket
 app.include_router(health.router)
 app.include_router(alerts.router)
-app.include_router(stream.router)
 app.include_router(analysis.router)
-app.include_router(twilio_stream.router)
-app.include_router(login.router, prefix="/api/v1", tags=["auth"])
-app.include_router(users.router, prefix="/api/v1", tags=["users"])
+app.include_router(stream.router)  # Endpoint WebSocket (/ws/stream-audio)
 
 if __name__ == "__main__":
-    import uvicorn
+  import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+  uvicorn.run(app, host="0.0.0.0", port=8000)
