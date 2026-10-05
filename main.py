@@ -10,7 +10,8 @@ from database import engine, init_db
 from api.routes import health, alerts, stream, analysis, twilio_stream, login, users
 
 # Importante: importar modelos para que SQLModel registre la tabla 'User'
-import models 
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 @asynccontextmanager

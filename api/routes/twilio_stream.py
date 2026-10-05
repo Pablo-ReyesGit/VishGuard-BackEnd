@@ -1,165 +1,314 @@
 # ==============================================================================
 # MÓDULO DE INTEGRACIÓN DE STREAMING DE VOZ DE TWILIO (VishGuard)
 # ==============================================================================
-# Este módulo se encarga de:
-# 1. Recibir la señal de una llamada telefónica entrante vía Webhook HTTP.
-# 2. Responder a Twilio con instrucciones en formato XML (TwiML) para iniciar un Stream.
-# 3. Abrir un canal WebSocket (`/ws/twilio`) para recibir fragmentos de audio en tiempo real.
-# 4. Decodificar el audio de mu-law a PCM, acumularlo en un buffer y pasarlo por la
-#    canalización de análisis (Whisper -> VishingAnalyzer -> Base de Datos).
+# Flujo:
+# 1. Twilio llama al webhook POST /twilio/voice.
+# 2. Respondemos TwiML: <Start><Stream> (con <Parameter to=...>) + <Dial>.
+# 3. Twilio abre el WebSocket /ws/twilio y envía audio mu-law 8 kHz en base64.
+# 4. Acumulamos 3 s de audio PCM16 y lo procesamos EN SEGUNDO PLANO:
+#    transcripción -> VishingAnalyzer -> notificación a la app -> DB.
+#
+# Variables de entorno:
+#   VISHGUARD_DESTINO   número real que debe sonar (E.164, ej. +502...)  [obligatoria]
+#   PUBLIC_URL          URL pública (ej. https://xxxx.ngrok-free.app)    [recomendada]
+#   TWILIO_AUTH_TOKEN   si está definida, se valida la firma de Twilio
+#   VISHGUARD_STT       simulado (defecto) | groq
+#   GROQ_API_KEY        necesaria si VISHGUARD_STT=groq
+#   GROQ_STT_MODEL      defecto whisper-large-v3-turbo
+#   VISHGUARD_DEBUG     1 para habilitar /debug/connections
+#
+# Dependencias: python-multipart (request.form), twilio, audioop-lts (Python 3.13+),
+# groq (solo si VISHGUARD_STT=groq).
 # ==============================================================================
 
+import asyncio
 import base64
+import binascii
+import io
 import json
+import logging
+import os
+import wave
+from typing import Optional
 
-# Importación segura de audioop (soporta Python 3.13 mediante audioop_lts si aplica)
-try:
-    import audioop
-except ImportError:
-    import audioopy as audioop
+# audioop es stdlib hasta Python 3.12. En 3.13+: pip install audioop-lts
+# (se sigue importando como `audioop`).
+import audioop
 
-# Componentes web de FastAPI
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from twilio.request_validator import RequestValidator
+from twilio.twiml.voice_response import Dial, Start, VoiceResponse
 
-# SDK de Twilio para construir respuestas TwiML (XML especial para llamadas)
-from twilio.twiml.voice_response import VoiceResponse, Start, Dial
-
-# Importaciones de la arquitectura propia de VishGuard
-from database import SessionLocal, AlertHistory
-from modules.analyzer import VishingAnalyzer
+from core.alert_service import guardar_alerta_si_aplica
 from core.connection_manager import manager
+from modules.analyzer import VishingAnalyzer
 
-# Inicialización del enrutador modular de FastAPI
+logger = logging.getLogger("vishguard.twilio")
+
 router = APIRouter()
-
-
-# Instancia del motor de análisis de fraudes (Groq LLM o motor heurístico de respaldo)
 analyzer = VishingAnalyzer()
+
+# --- Parámetros de audio ------------------------------------------------------
+# 8000 Hz x 2 bytes = 16,000 bytes/s  ->  48,000 bytes = 3 s
+BYTES_POR_SEGUNDO = 8000 * 2
+CHUNK_BYTES = BYTES_POR_SEGUNDO * 3
+MIN_REMANENTE_BYTES = BYTES_POR_SEGUNDO // 2   # 0.5 s mínimo al cortar la llamada
+UMBRAL_SILENCIO_RMS = 150                      # por debajo se considera silencio
+
+STT_MODE = os.getenv("VISHGUARD_STT", "simulado").lower()
+
+# Referencias fuertes a los análisis en curso: asyncio solo guarda referencias
+# débiles a las tareas y podría recolectarlas antes de terminar.
+_TAREAS_ACTIVAS: set[asyncio.Task] = set()
+
+
+def _mask(numero: Optional[str]) -> str:
+    return f"***{numero[-4:]}" if numero else "?"
+
+
+# ==============================================================================
+# UTILIDADES DE URL Y SEGURIDAD
+# ==============================================================================
+def _urls_publicas(request: Request) -> tuple[str, str]:
+    """Devuelve (base_http, base_ws). Prefiere PUBLIC_URL; si no, usa el Host."""
+    public = os.getenv("PUBLIC_URL", "").rstrip("/")
+    if public:
+        ws_base = public.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        return public, ws_base
+
+    host = request.headers.get("host")
+    if not host:
+        raise HTTPException(status_code=400, detail="Falta la cabecera Host")
+    https = "ngrok" in host or request.headers.get("x-forwarded-proto") == "https"
+    return (
+        f"{'https' if https else 'http'}://{host}",
+        f"{'wss' if https else 'ws'}://{host}",
+    )
+
+
+def _validar_firma_twilio(request: Request, http_base: str, form) -> None:
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not token:
+        logger.warning("TWILIO_AUTH_TOKEN no definido: webhook SIN validar firma")
+        return
+    url = f"{http_base}{request.url.path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    firma = request.headers.get("X-Twilio-Signature", "")
+    if not RequestValidator(token).validate(url, dict(form), firma):
+        raise HTTPException(status_code=403, detail="Firma de Twilio inválida")
 
 
 # ==============================================================================
 # PASO 1: WEBHOOK HTTP - RECEPCIÓN DE LA LLAMADA
 # ==============================================================================
-
 @router.post("/twilio/voice")
 async def twilio_voice_webhook(request: Request):
-    host = request.headers.get("host")
-    ws_protocol = "wss" if "ngrok" in host or request.headers.get("x-forwarded-proto") == "https" else "ws"
+    http_base, ws_base = _urls_publicas(request)
 
-    numero_destino = "+50257008032"  # el celular real que debe sonar
+    form = await request.form()
+    _validar_firma_twilio(request, http_base, form)
+
+    destino = manager.normalizar(os.getenv("VISHGUARD_DESTINO"))
+    if not destino:
+        logger.error("VISHGUARD_DESTINO no está configurada")
+        raise HTTPException(status_code=500, detail="Destino no configurado")
 
     response = VoiceResponse()
 
-    # Inicia el streaming de audio SIN bloquear la llamada
+    # Stream del audio entrante (la voz del llamante) sin bloquear la llamada.
+    # El número va como <Parameter>, NO en la query string de la URL.
     start = Start()
-    start.stream(url=f"{ws_protocol}://{host}/ws/twilio?to={numero_destino}")
+    stream = start.stream(url=f"{ws_base}/ws/twilio", track="inbound_track")
+    stream.parameter(name="to", value=destino)
     response.append(start)
 
-    # Reenvía la llamada real al teléfono del usuario
-    dial = Dial()
-    dial.number(numero_destino)
+    # answer_on_bridge: Twilio no contesta hasta que el usuario conteste.
+    dial = Dial(answer_on_bridge=True)
+    dial.number(destino)
     response.append(dial)
 
-    return HTMLResponse(content=str(response), media_type="application/xml")
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ==============================================================================
+# TRANSCRIPCIÓN (bloqueante: se ejecuta en un hilo con asyncio.to_thread)
+# ==============================================================================
+_groq_client = None
+
+
+def _get_groq():
+    global _groq_client
+    if _groq_client is None:
+        from groq import Groq
+
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
+
+
+def _a_wav_16k(pcm8k: bytes) -> bytes:
+    """PCM16 8 kHz mono -> WAV 16 kHz mono (lo que Whisper espera)."""
+    pcm16k, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm16k)
+    return buf.getvalue()
+
+
+def transcribir_audio(pcm8k: bytes) -> str:
+    if STT_MODE == "simulado":
+        return "Simulación: Necesitamos confirmación de su clave bancaria por seguridad urgente."
+
+    # Silencio: no gastar una llamada a la API
+    if audioop.rms(pcm8k, 2) < UMBRAL_SILENCIO_RMS:
+        return ""
+
+    if STT_MODE == "groq":
+        resultado = _get_groq().audio.transcriptions.create(
+            file=("audio.wav", _a_wav_16k(pcm8k)),
+            model=os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo"),
+            language="es",
+            response_format="text",
+        )
+        texto = resultado if isinstance(resultado, str) else getattr(resultado, "text", "")
+        return (texto or "").strip()
+
+    logger.error("VISHGUARD_STT desconocido: %s", STT_MODE)
+    return ""
+
+
+# ==============================================================================
+# CANALIZACIÓN DE ANÁLISIS (corre en segundo plano, sin frenar el audio)
+# ==============================================================================
+async def _procesar_chunk(pcm: bytes, destino: Optional[str], lock: asyncio.Lock):
+    # El lock mantiene el orden de los resultados dentro de una misma llamada.
+    async with lock:
+        try:
+            texto = await asyncio.to_thread(transcribir_audio, pcm)
+            if not texto:
+                return
+
+            resultado = await asyncio.to_thread(analyzer.analizar_texto, texto)
+            logger.info(
+                "[VishGuard] riesgo=%s score=%s",
+                resultado.get("nivel_riesgo"),
+                resultado.get("score"),
+            )
+
+            if destino:
+                await manager.enviar_a(destino, resultado)
+
+            # Con STT simulado NO se guarda en la DB (evita alertas falsas).
+            if STT_MODE != "simulado":
+                await asyncio.to_thread(guardar_alerta_si_aplica, resultado)
+        except Exception:
+            logger.exception("Error procesando chunk de audio")
+
 
 # ==============================================================================
 # PASO 2: WEBSOCKET - PROCESAMIENTO DE AUDIO EN TIEMPO REAL
 # ==============================================================================
 @router.websocket("/ws/twilio")
-async def twilio_websocket_endpoint(websocket: WebSocket, to: str):
-    """
-    Canal de comunicación continua de doble vía.
-    Twilio transmite aquí el audio de la llamada dividida en pequeños 'chunks' (paquetes).
-    """
-    # Acepta y valida el apretón de manos (handshake) del WebSocket
-    await websocket.accept()
-    print("[Twilio WS] Conexión WebSocket establecida con Twilio.")
+async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = None):
+    """Twilio transmite aquí el audio de la llamada en eventos JSON.
 
-    # Buffer temporal binario en memoria para ir reuniendo los paquetes de audio
+    `to` por query string se mantiene solo como respaldo; el valor normal
+    llega en el evento `start` (customParameters).
+    """
+    await websocket.accept()
+    logger.info("Conexión WebSocket establecida con Twilio")
+
+    destino = manager.normalizar(to) or None
     audio_buffer = bytearray()
+    lock = asyncio.Lock()
+    tareas: set[asyncio.Task] = set()
+
+    def lanzar(pcm: bytes):
+        tarea = asyncio.create_task(_procesar_chunk(pcm, destino, lock))
+        tareas.add(tarea)
+        _TAREAS_ACTIVAS.add(tarea)
+        tarea.add_done_callback(tareas.discard)
+        tarea.add_done_callback(_TAREAS_ACTIVAS.discard)
 
     try:
-        # Bucle infinito mientras la llamada y la conexión sigan activas
         while True:
-            # Recibe el mensaje enviado por Twilio (llega en texto JSON)
-            message = await websocket.receive_text()
-            data = json.loads(message)
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
             event = data.get("event")
 
-            # EVENTO 1: Inicio de la transmisión de audio
             if event == "start":
-                stream_sid = data.get("streamSid")
-                print(f"[Twilio WS] Stream Iniciado (SID: {stream_sid})")
+                info = data.get("start", {})
+                params = info.get("customParameters") or {}
+                destino = manager.normalizar(params.get("to")) or destino
+                logger.info(
+                    "Stream iniciado (callSid=%s, destino=%s)",
+                    info.get("callSid"),
+                    _mask(destino),
+                )
 
-            # EVENTO 2: Llega un bloque de audio de la llamada
             elif event == "media":
-                # Twilio envía el audio codificado en formato Base64
-                payload = data["media"]["payload"]
-                
-                # Decodificar el texto Base64 a bytes puros (formato comprimido mu-law de telefonia)
-                raw_mulaw = base64.b64decode(payload)
+                payload = (data.get("media") or {}).get("payload")
+                if not payload:
+                    continue
+                try:
+                    raw_mulaw = base64.b64decode(payload, validate=True)
+                except (binascii.Error, ValueError):
+                    logger.warning("Payload base64 inválido: se descarta el frame")
+                    continue
+                # mu-law 8 kHz -> PCM lineal 16 bit
+                audio_buffer.extend(audioop.ulaw2lin(raw_mulaw, 2))
 
-                # Convertir el audio telefónico (mu-law 8kHz) a audio lineal descomprimido PCM 16-bit
-                # (formato estándar requerido por Whisper y la mayoría de clasificadores)
-                pcm16_data = audioop.ulaw2lin(raw_mulaw, 2)
-                
-                # Agregar los nuevos bytes descompresionados al buffer acumulativo
-                audio_buffer.extend(pcm16_data)
-
-                # REGLA DE PROCESAMIENTO:
-                # 8000 Hz x 16 bits (2 bytes por muestra) = 16,000 bytes por segundo.
-                # 48,000 bytes equivalen a exactamente 3 segundos de audio acumulado.
-                if len(audio_buffer) >= 48000:
-                    # Copiamos los bytes acumulados hasta el momento
-                    chunk_to_process = bytes(audio_buffer)
-                    # Limpiamos el buffer para recibir los siguientes 3 segundos
+                if len(audio_buffer) >= CHUNK_BYTES:
+                    lanzar(bytes(audio_buffer))
                     audio_buffer.clear()
 
-                    # ----------------------------------------------------------
-                    # CANALIZACIÓN DE ANÁLISIS DE VISHGUARD
-                    # ----------------------------------------------------------
-                    
-                    # Sub-paso A: Transcripción
-                    # Aquí se alimentará `chunk_to_process` a Whisper. Por ahora se usa un string simulación:
-                    texto_transcrito = "Simulación: Necesitamos confirmación de su clave bancaria por seguridad urgente."
-
-                    # Sub-paso B: Evaluación de Fraude/Vishing
-                    # Se llama a VishingAnalyzer que internamente decidirá si usa Groq LLM o la Heurística local
-                    resultado = analyzer.analizar_texto(texto_transcrito)
-                    await manager.enviar_a(to, resultado)
-                    print(f"[VishGuard Analysis]: {resultado}")
-
-                    # Sub-paso C: Persistencia en Base de Datos
-                    # Si el nivel de amenaza detectado es riesgoso, se almacena en el historial
-                    nivel = resultado.get("nivel_riesgo")
-                    if nivel in ["PELIGROSO", "FRAUDE", "MEDIO"]:
-                        db = SessionLocal()  # Abre una sesión de base de datos
-                        try:
-                            # Crea el objeto según el ORM de SQLAlchemy definido en database.py
-                            nueva_alerta = AlertHistory(
-                                #texto=texto_transcrito,
-                                nivel_riesgo=nivel,
-                                score=resultado.get("score", 0),
-                                recomendacion=resultado.get("recomendacion", "")
-                            )
-                            db.add(nueva_alerta)  # Guarda el registro
-                            db.commit()          # Confirma los cambios en la DB
-                        finally:
-                            db.close()           # Cierra la sesión para evitar fugas de conexiones
-
-            # EVENTO 3: El usuario o la centralita cuelgan la llamada
             elif event == "stop":
-                print("[Twilio WS] Transmisión de audio finalizada por Twilio.")
-                if len(audio_buffer) > 0:
-                    # procesar el remanente igual que el bloque de arriba (mismo sub-paso A/B/C)
-                    pass
+                logger.info("Transmisión finalizada por Twilio")
+                if len(audio_buffer) >= MIN_REMANENTE_BYTES:
+                    lanzar(bytes(audio_buffer))
+                    audio_buffer.clear()
                 break
 
-    except WebSocketDisconnect:
-        print("[Twilio WS] Conexión cerrada de forma abrupta por el cliente/Twilio.")
+            # "connected", "mark", "dtmf": se ignoran
 
+    except WebSocketDisconnect:
+        logger.info("Conexión cerrada abruptamente por Twilio")
+    except Exception:
+        logger.exception("Error en /ws/twilio")
+    finally:
+        # Deja terminar los análisis pendientes (incluye el remanente).
+        # shield: si el servidor cancela este handler por una desconexión
+        # abrupta, los análisis NO se cancelan y terminan en segundo plano.
+        if tareas:
+            await asyncio.shield(asyncio.gather(*tareas, return_exceptions=True))
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ==============================================================================
+# DEBUG (apagado por defecto; sin números completos)
+# ==============================================================================
 @router.get("/debug/connections")
 def ver_conexiones():
-    from core.connection_manager import manager
-    return {"conectados": list(manager.active_connections.keys())}
+    if os.getenv("VISHGUARD_DEBUG", "").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=404)
+    return {
+        "total": len(manager.active_connections),
+        "conectados": [_mask(n) for n in manager.active_connections],
+    }

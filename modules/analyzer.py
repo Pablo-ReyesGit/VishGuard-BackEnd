@@ -30,7 +30,7 @@ class VishingAnalyzer:
                         "role": "user",
                         "content": self._prompt(texto)
                     }
-                ],
+                ],  
                 response_format={"type": "json_object"},
                 max_tokens=250,
                 temperature=0.1,

@@ -10,7 +10,7 @@ from sqlmodel import Session
 
 from core import security
 from core.config import settings
-from database import engine  # ver nota abajo sobre este import
+from database import engine  
 from models.user import User
 from schemas.token import TokenPayload
 
