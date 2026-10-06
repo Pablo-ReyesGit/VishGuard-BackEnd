@@ -10,6 +10,22 @@ from fastapi.middleware.cors import CORSMiddleware
 # Inicialización de la base de datos local (SQLite/PostgreSQL)
 init_db()
 
+<<<<<<< HEAD
+=======
+# Importante: importar modelos para que SQLModel registre la tabla 'User'
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicializa y crea todas las tablas en Neon/Postgres al arrancar
+    init_db()
+    yield
+
+
+# Instanciación ÚNICA pasando el lifespan
+>>>>>>> Pablo
 app = FastAPI(
     title="VishGuard AI - Calibrated Detection Engine",
     description="Motor en tiempo real para detección de Vishing mediante Groq Whisper y LLaMA",
