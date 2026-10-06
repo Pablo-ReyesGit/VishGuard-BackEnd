@@ -1,17 +1,14 @@
 from dotenv import load_dotenv
+load_dotenv()  # DEBE IR PRIMERO que las importaciones de api.routes
 
-load_dotenv()  # Carga variables (.env) antes de importar submódulos
-
-from api.routes import alerts, analysis, health, stream
-from database import init_db
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import SQLModel
 
-# Inicialización de la base de datos local (SQLite/PostgreSQL)
-init_db()
+from database import engine, init_db
+from api.routes import health, alerts, stream, analysis, twilio_stream, login, users
 
-<<<<<<< HEAD
-=======
 # Importante: importar modelos para que SQLModel registre la tabla 'User'
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -25,14 +22,12 @@ async def lifespan(app: FastAPI):
 
 
 # Instanciación ÚNICA pasando el lifespan
->>>>>>> Pablo
 app = FastAPI(
     title="VishGuard AI - Calibrated Detection Engine",
-    description="Motor en tiempo real para detección de Vishing mediante Groq Whisper y LLaMA",
-    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Configuración de permisos CORS para comunicación fluida con Android
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,13 +36,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inclusión de Routers HTTP y WebSocket
+# Inclusión de routers
 app.include_router(health.router)
 app.include_router(alerts.router)
+app.include_router(stream.router)
 app.include_router(analysis.router)
-app.include_router(stream.router)  # Endpoint WebSocket (/ws/stream-audio)
+app.include_router(twilio_stream.router)
+app.include_router(login.router, prefix="/api/v1", tags=["auth"])
+app.include_router(users.router, prefix="/api/v1", tags=["users"])
 
 if __name__ == "__main__":
-  import uvicorn
+    import uvicorn
 
-  uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    #endpoint ngrok https://dealmaker-sputter-antiviral.ngrok-free.dev
