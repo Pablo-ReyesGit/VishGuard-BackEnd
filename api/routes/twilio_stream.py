@@ -16,7 +16,15 @@
 #   VISHGUARD_DESTINO   número real que debe sonar (E.164, ej. +502...)  [obligatoria]
 #   PUBLIC_URL          URL pública (ej. https://xxxx.ngrok-free.app)    [recomendada]
 #   TWILIO_AUTH_TOKEN   si está definida, se valida la firma de Twilio
-#   VISHGUARD_STT       simulado (defecto) | groq
+#   VISHGUARD_STT       motor de transcripción:
+#                         simulado (defecto)  NO transcribe: analiza siempre un texto fijo
+#                         whisper             faster-whisper local  (modules/stt.py: SpeechToText)
+#                         gemini              Gemini multimodal     (modules/stt.py: SpeechToTextService)
+#                         groq                Whisper en la API de Groq
+#   WHISPER_MODEL       modelo de faster-whisper (defecto: tiny)
+#   WHISPER_DEVICE      cpu (defecto) | cuda
+#   WHISPER_COMPUTE     int8 (defecto) | float16 | ...
+#   GEMINI_API_KEY      necesaria si VISHGUARD_STT=gemini
 #   GROQ_API_KEY        necesaria si VISHGUARD_STT=groq
 #   GROQ_STT_MODEL      defecto whisper-large-v3-turbo
 #   VISHGUARD_DEBUG     1 para habilitar /debug/connections
@@ -26,8 +34,9 @@
 #   VISHGUARD_WAV_MODO     estereo (defecto: izq=llamante, der=receptor) | mono (mezcla)
 #
 # PUNTOS DE EXTENSIÓN (de afuera hacia adentro):
-#   * transcribir_audio(pcm8k) -> str   Entrega del equipo de Whisper: se sustituye el cuerpo.
-#                                       Entrada: PCM16 mono 8 kHz, bloques de 3 s (48,000 bytes).
+#   * transcribir_audio(pcm8k) -> str   Elige el motor según VISHGUARD_STT (ver arriba).
+#                                       Entrada: PCM16 mono 8 kHz, bloques de 3 s (48,000 bytes),
+#                                       de UN solo hablante.
 #   * _etapa_analisis(texto) -> dict    Único punto donde añadir, más adelante, un interruptor
 #                                       para saltarse el análisis de IA.
 #   * GrabadorWav                       Verificación: deja en disco lo MISMO que entra a la
@@ -45,6 +54,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import threading
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -134,7 +145,9 @@ class GrabadorWav:
             # [A-Za-z0-9_-] para que no pueda escapar de la carpeta (../).
             seguro = re.sub(r"[^A-Za-z0-9_-]", "", call_sid or "")[:64] or "sin_sid"
             marca = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.ruta = carpeta / f"{seguro}_{marca}.wav"
+            # Sufijo aleatorio: dos conexiones sin callSid en el mismo segundo no deben
+            # pisarse el archivo (pasaba con "sin_sid_<fecha>.wav").
+            self.ruta = carpeta / f"{seguro}_{marca}_{secrets.token_hex(2)}.wav"
             self._volcar()  # comprueba AHORA que se puede escribir (avisa al inicio)
             self._activa = True
             logger.info("Grabando la conversación en %s", self.ruta)
@@ -296,13 +309,82 @@ def _a_wav_16k(pcm8k: bytes) -> bytes:
     return buf.getvalue()
 
 
+_stt_whisper = None
+_stt_gemini = None
+_stt_cerrojo = threading.Lock()   # la carga de un modelo ocurre una sola vez
+
+
+def _get_whisper():
+    """faster-whisper local. Se carga al primer uso (puede tardar; ver precargar_stt)."""
+    global _stt_whisper
+    with _stt_cerrojo:
+        if _stt_whisper is None:
+            from modules.stt import SpeechToText
+
+            _stt_whisper = SpeechToText()
+        return _stt_whisper
+
+
+def _get_gemini():
+    """Gemini multimodal (servicio de la rama Karen)."""
+    global _stt_gemini
+    with _stt_cerrojo:
+        if _stt_gemini is None:
+            from modules.stt import SpeechToTextService
+
+            _stt_gemini = SpeechToTextService()
+        return _stt_gemini
+
+
+def precargar_stt() -> None:
+    """Carga el motor configurado ANTES de la primera llamada (opcional).
+
+    Con Whisper local el primer bloque tardaría varios segundos en cargar el
+    modelo; llámala al arrancar, por ejemplo en el lifespan de main.py:
+        await asyncio.to_thread(twilio_stream.precargar_stt)
+    """
+    if STT_MODE == "whisper":
+        _get_whisper()
+    elif STT_MODE == "gemini":
+        _get_gemini()
+
+
+_aviso_stt_emitido = False
+
+
+def _avisar_modo_stt() -> None:
+    """Una sola vez por proceso: deja claro qué motor de transcripción está activo."""
+    global _aviso_stt_emitido
+    if _aviso_stt_emitido:
+        return
+    _aviso_stt_emitido = True
+    if STT_MODE == "simulado":
+        logger.warning(
+            "STT en modo SIMULADO: NO se transcribe el audio real, siempre se analiza un "
+            "texto fijo. Define VISHGUARD_STT=whisper, gemini o groq para transcribir de verdad."
+        )
+    elif STT_MODE in ("whisper", "gemini", "groq"):
+        logger.info("STT activo: %s", STT_MODE)
+    else:
+        logger.error("VISHGUARD_STT desconocido: %s (usa simulado, whisper, gemini o groq)", STT_MODE)
+
+
 def transcribir_audio(pcm8k: bytes) -> str:
+    """Transcribe un bloque de audio de UN hablante (PCM16 mono 8 kHz). Corre en un hilo."""
     if STT_MODE == "simulado":
         return "Simulación: Necesitamos confirmación de su clave bancaria por seguridad urgente."
 
-    # Silencio: no gastar una llamada a la API
+    # Silencio: no gastar un motor de transcripción (ni una llamada a la API)
     if audioop.rms(pcm8k, 2) < UMBRAL_SILENCIO_RMS:
         return ""
+
+    if STT_MODE == "whisper":
+        return _get_whisper().transcribir_pcm(pcm8k)
+
+    if STT_MODE == "gemini":
+        from modules.stt import pcm8k_a_16k
+
+        return _get_gemini().transcribir_audio_bytes(pcm8k_a_16k(pcm8k))
 
     if STT_MODE == "groq":
         resultado = _get_groq().audio.transcriptions.create(
@@ -394,6 +476,7 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
     llega en el evento `start` (customParameters).
     """
     await websocket.accept()
+    _avisar_modo_stt()
     logger.info("Conexión WebSocket establecida con Twilio")
 
     destino = manager.normalizar(to) or None   # quien RECIBE la llamada

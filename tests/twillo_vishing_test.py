@@ -1295,7 +1295,7 @@ def test_wav_filename_is_sanitized_against_path_traversal(client, fakes, fake_ma
     archivos = list(tmp_path.rglob("*.wav"))
     assert len(archivos) == 1
     assert archivos[0].parent == grabar                        # no escapó de la carpeta
-    assert re.fullmatch(r"evil_\d{8}_\d{6}\.wav", archivos[0].name)
+    assert re.fullmatch(r"evil_\d{8}_\d{6}_[0-9a-f]{4}\.wav", archivos[0].name)
 
 
 @pytest.mark.integration
@@ -1586,6 +1586,275 @@ def test_recorder_ignores_unknown_tracks_and_bad_timestamps(twilio_stream_mod, g
 
     wav = leer_wav(next(grabar.glob("*.wav")))
     assert wav.frames == 160
+
+
+# ============================================================================
+# MOTORES DE TRANSCRIPCIÓN (modules/stt.py) Y SU CONEXIÓN CON LA LLAMADA
+# ============================================================================
+# Se prueban con modelos FALSOS: no descargan Whisper ni llaman a Gemini. Lo que se
+# comprueba es la conexión: formato del audio, parámetros y elección del motor.
+
+
+class FakeWhisperModel:
+    """Sustituye a faster_whisper.WhisperModel."""
+
+    instancias: List[Any] = []
+
+    def __init__(self, model_size_or_path, device, compute_type):
+        self.args = (model_size_or_path, device, compute_type)
+        self.llamadas: List[Any] = []
+        FakeWhisperModel.instancias.append(self)
+
+    def transcribe(self, audio, **kwargs):
+        self.llamadas.append((audio, kwargs))
+        segmentos = [SimpleNamespace(text=" hola "), SimpleNamespace(text="mundo ")]
+        return iter(segmentos), SimpleNamespace(language="es")  # generador, como el real
+
+
+class FakeGeminiClient:
+    """Sustituye a google.genai.Client."""
+
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.llamadas: List[Any] = []
+        self.fallan: set = set()
+        self.models = SimpleNamespace(generate_content=self._generar)
+
+    def _generar(self, model, contents):
+        self.llamadas.append((model, contents))
+        if model in self.fallan:
+            raise RuntimeError("modelo caído")
+        return SimpleNamespace(text="  texto de gemini ")
+
+
+@pytest.fixture
+def stt_mod(monkeypatch):
+    """modules/stt.py aislado: sin leer el .env real ni variables de Whisper del entorno."""
+    modulo = importlib.import_module("modules.stt")
+    monkeypatch.setattr(modulo, "load_dotenv", lambda *a, **k: None)
+    for variable in ("WHISPER_MODEL", "WHISPER_DEVICE", "WHISPER_COMPUTE"):
+        monkeypatch.delenv(variable, raising=False)
+    return modulo
+
+
+@pytest.fixture
+def fake_faster_whisper(monkeypatch):
+    import sys
+    import types
+
+    pytest.importorskip("numpy")
+    FakeWhisperModel.instancias.clear()
+    falso = types.ModuleType("faster_whisper")
+    falso.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", falso)
+    return FakeWhisperModel
+
+
+@pytest.fixture
+def fake_gemini(monkeypatch):
+    import sys
+    import types
+
+    cliente = FakeGeminiClient()
+    google = types.ModuleType("google")
+    genai = types.ModuleType("google.genai")
+    tipos = types.ModuleType("google.genai.types")
+
+    def crear_cliente(api_key=None):
+        cliente.api_key = api_key
+        return cliente
+
+    genai.Client = crear_cliente
+    genai.types = tipos
+    tipos.Part = SimpleNamespace(
+        from_bytes=lambda data, mime_type: SimpleNamespace(data=data, mime_type=mime_type)
+    )
+    google.genai = genai
+    monkeypatch.setitem(sys.modules, "google", google)
+    monkeypatch.setitem(sys.modules, "google.genai", genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", tipos)
+    monkeypatch.setenv("GEMINI_API_KEY", "clave-de-prueba")
+    return cliente
+
+
+@pytest.mark.unit
+def test_pcm8k_a_16k_doubles_the_sample_rate(stt_mod):
+    pcm8k = decodificado(BYTE_LLAMANTE, FRAMES_3S)                # 3 s a 8 kHz = 48,000 bytes
+    assert abs(len(stt_mod.pcm8k_a_16k(pcm8k)) - 2 * len(pcm8k)) <= 8   # 3 s a 16 kHz
+
+
+@pytest.mark.unit
+def test_whisper_engine_transcribes_a_pcm_block_in_memory(stt_mod, fake_faster_whisper):
+    import numpy as np
+
+    motor = stt_mod.SpeechToText()
+    modelo = fake_faster_whisper.instancias[0]
+    assert modelo.args == ("tiny", "cpu", "int8")                 # los valores de tu rama Pablo
+
+    assert motor.transcribir_pcm(decodificado(BYTE_LLAMANTE, FRAMES_3S)) == "hola mundo"
+
+    audio, opciones = modelo.llamadas[0]
+    assert audio.dtype == np.float32 and audio.ndim == 1          # lo que acepta faster-whisper
+    assert abs(len(audio) - 48_000) <= 8                          # 3 s a 16 kHz
+    assert float(np.abs(audio).max()) <= 1.0                      # normalizado a [-1, 1]
+    assert opciones == {"language": "es", "beam_size": 1, "vad_filter": True}
+
+
+@pytest.mark.unit
+def test_whisper_engine_model_is_configurable_by_environment(stt_mod, fake_faster_whisper, monkeypatch):
+    monkeypatch.setenv("WHISPER_MODEL", "base")
+    monkeypatch.setenv("WHISPER_DEVICE", "cuda")
+    monkeypatch.setenv("WHISPER_COMPUTE", "float16")
+    stt_mod.SpeechToText()
+    assert fake_faster_whisper.instancias[0].args == ("base", "cuda", "float16")
+
+
+@pytest.mark.unit
+def test_whisper_engine_keeps_the_original_file_api(stt_mod, fake_faster_whisper, tmp_path):
+    """La API de tu rama Pablo (transcribir_audio(ruta)) sigue funcionando."""
+    archivo = tmp_path / "prueba.wav"
+    archivo.write_bytes(b"RIFF")
+    motor = stt_mod.SpeechToText()
+    assert motor.transcribir_audio(str(archivo)) == "hola mundo"
+    with pytest.raises(FileNotFoundError):
+        motor.transcribir_audio(str(tmp_path / "no_existe.wav"))
+
+
+@pytest.mark.unit
+def test_gemini_service_sends_a_wav_at_the_real_sample_rate(stt_mod, fake_gemini):
+    import io as _io
+    import wave as _wave
+
+    servicio = stt_mod.SpeechToTextService()
+    assert servicio.transcribir_audio_bytes(bytes(3200)) == "texto de gemini"
+
+    modelo, contenido = fake_gemini.llamadas[0]
+    assert modelo == "gemini-3.5-flash-lite"
+    assert contenido[0].mime_type == "audio/wav"
+    with _wave.open(_io.BytesIO(contenido[0].data), "rb") as wav:
+        assert (wav.getnchannels(), wav.getframerate()) == (1, 16000)
+
+    servicio.transcribir_audio_bytes(bytes(3200), sample_rate=8000)   # parámetro nuevo
+    with _wave.open(_io.BytesIO(fake_gemini.llamadas[1][1][0].data), "rb") as wav:
+        assert wav.getframerate() == 8000
+
+
+@pytest.mark.unit
+def test_gemini_service_falls_back_to_the_next_model(stt_mod, fake_gemini):
+    fake_gemini.fallan = {"gemini-3.5-flash-lite"}
+    assert stt_mod.SpeechToTextService().transcribir_audio_bytes(bytes(3200)) == "texto de gemini"
+    assert [m for m, _ in fake_gemini.llamadas] == ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
+
+
+@pytest.mark.unit
+def test_gemini_service_returns_empty_when_every_model_fails(stt_mod, fake_gemini):
+    fake_gemini.fallan = {"gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"}
+    assert stt_mod.SpeechToTextService().transcribir_audio_bytes(bytes(3200)) == ""
+
+
+@pytest.mark.unit
+def test_gemini_service_without_api_key_returns_empty(stt_mod, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    servicio = stt_mod.SpeechToTextService()
+    assert servicio.client is None
+    assert servicio.transcribir_audio_bytes(bytes(3200)) == ""
+
+
+@pytest.mark.unit
+def test_stt_whisper_mode_uses_the_local_engine(monkeypatch, twilio_stream_mod):
+    recibido: List[int] = []
+    motor = SimpleNamespace(transcribir_pcm=lambda pcm: recibido.append(len(pcm)) or "hola desde whisper")
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", "whisper")
+    monkeypatch.setattr(twilio_stream_mod, "_get_whisper", lambda: motor)
+
+    assert twilio_stream_mod.transcribir_audio(decodificado(BYTE_LLAMANTE, FRAMES_3S)) == "hola desde whisper"
+    assert recibido == [CHUNK_BYTES]                              # PCM de 8 kHz tal como llega
+
+
+@pytest.mark.unit
+def test_stt_gemini_mode_receives_audio_converted_to_16khz(monkeypatch, twilio_stream_mod):
+    recibido: List[int] = []
+    motor = SimpleNamespace(transcribir_audio_bytes=lambda pcm: recibido.append(len(pcm)) or "hola desde gemini")
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", "gemini")
+    monkeypatch.setattr(twilio_stream_mod, "_get_gemini", lambda: motor)
+
+    assert twilio_stream_mod.transcribir_audio(decodificado(BYTE_LLAMANTE, FRAMES_3S)) == "hola desde gemini"
+    assert abs(recibido[0] - 2 * CHUNK_BYTES) <= 8                # el doble de bytes: 16 kHz, no 8 kHz
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("modo, motor", [("whisper", "_get_whisper"), ("gemini", "_get_gemini")])
+def test_stt_engines_are_not_used_for_silence(monkeypatch, twilio_stream_mod, modo, motor):
+    def no_debe_llamarse():
+        raise AssertionError("el motor no debe cargarse ni usarse con silencio")
+
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", modo)
+    monkeypatch.setattr(twilio_stream_mod, motor, no_debe_llamarse)
+    assert twilio_stream_mod.transcribir_audio(decodificado(0xFF, FRAMES_3S)) == ""
+
+
+@pytest.mark.unit
+def test_unknown_stt_mode_returns_empty_and_logs_an_error(monkeypatch, twilio_stream_mod, caplog):
+    import logging
+
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", "inventado")
+    with caplog.at_level(logging.ERROR, logger="vishguard.twilio"):
+        assert twilio_stream_mod.transcribir_audio(decodificado(BYTE_LLAMANTE, FRAMES_3S)) == ""
+    assert any("desconocido" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
+def test_simulated_mode_warns_once_that_nothing_is_transcribed(monkeypatch, twilio_stream_mod, caplog):
+    import logging
+
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", "simulado")
+    monkeypatch.setattr(twilio_stream_mod, "_aviso_stt_emitido", False)
+    with caplog.at_level(logging.WARNING, logger="vishguard.twilio"):
+        twilio_stream_mod._avisar_modo_stt()
+        twilio_stream_mod._avisar_modo_stt()
+    avisos = [r for r in caplog.records if "SIMULADO" in r.getMessage()]
+    assert len(avisos) == 1                                       # una sola vez por proceso
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_first_call_in_simulated_mode_logs_the_warning(client, fakes, fake_manager, monkeypatch, twilio_stream_mod, caplog):
+    import logging
+
+    monkeypatch.setattr(twilio_stream_mod, "STT_MODE", "simulado")
+    monkeypatch.setattr(twilio_stream_mod, "_aviso_stt_emitido", False)
+    with caplog.at_level(logging.WARNING, logger="vishguard.twilio"):
+        with client.websocket_connect(TWILIO_WS) as ws:
+            ws.send_json(ev_start())
+            finish_call(ws)
+    assert any("SIMULADO" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
+def test_recorders_without_callsid_in_the_same_second_do_not_overwrite_each_other(twilio_stream_mod, grabar):
+    a = twilio_stream_mod.GrabadorWav(None)
+    b = twilio_stream_mod.GrabadorWav(None)
+    assert a.ruta != b.ruta
+    a.escribir("inbound", b"\x01\x00" * 160, 0)
+    b.escribir("inbound", b"\x01\x00" * 160, 0)
+    a.cerrar()
+    b.cerrar()
+    assert len(list(grabar.glob("*.wav"))) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_two_simultaneous_calls_without_callsid_leave_two_recordings(client, fakes, fake_manager, grabar):
+    """Reproduce los logs de las 08:49: dos conexiones a la vez, `start` sin callSid."""
+    inicio = {"event": "start", "streamSid": "TEST123"}
+    with client.websocket_connect(TWILIO_WS) as a, client.websocket_connect(TWILIO_WS) as b:
+        a.send_json(inicio)
+        b.send_json(inicio)
+        send_audio(a, 50)
+        send_audio(b, 50)
+        finish_call(a)
+        finish_call(b)
+    assert len(list(grabar.glob("sin_sid_*.wav"))) == 2
 
 
 # ============================================================================
