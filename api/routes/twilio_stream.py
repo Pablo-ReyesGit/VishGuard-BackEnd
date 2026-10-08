@@ -28,6 +28,7 @@
 #   GROQ_API_KEY        necesaria si VISHGUARD_STT=groq
 #   GROQ_STT_MODEL      defecto whisper-large-v3-turbo
 #   VISHGUARD_DEBUG     1 para habilitar /debug/connections
+#   VISHGUARD_LOG_TEXTO 1 imprime en el log lo que dice cada hablante (SOLO PRUEBAS, ver más abajo)
 #   VISHGUARD_GUARDAR_WAV  1 para guardar el audio de cada llamada en un .wav (apagado por defecto)
 #   VISHGUARD_WAV_DIR      carpeta de las grabaciones (defecto: grabaciones)
 #   VISHGUARD_WAV_MAX_SEG  tope de segundos grabados por llamada y por pista (defecto: 600)
@@ -349,6 +350,27 @@ def precargar_stt() -> None:
         _get_gemini()
 
 
+# ---------------------------------------------------------------------------
+# LOG DE TEXTO (SOLO PARA PRUEBAS)  -  inicio del bloque
+# Imprime en el log lo que transcribió cada hablante, para evaluar a mano la
+# calidad de Whisper. Apagado por defecto: se activa con VISHGUARD_LOG_TEXTO=1.
+# Las conversaciones son datos personales: NO lo dejes activo en producción.
+# Para eliminarlo: borra este bloque, la llamada `_log_texto_prueba(...)` en
+# `_procesar_chunk` y el `if` marcado en `_avisar_modo_stt`.
+# ---------------------------------------------------------------------------
+def _log_texto_activo() -> bool:
+    return os.getenv("VISHGUARD_LOG_TEXTO", "").lower() in ("1", "true", "yes")
+
+
+def _log_texto_prueba(hablante: str, texto: str, inicio_ms: Optional[int]) -> None:
+    if not _log_texto_activo():
+        return
+    cuando = f"{inicio_ms / 1000:.1f} s" if inicio_ms is not None else "?"
+    logger.info("[TEXTO] %s @ %s: %s", hablante, cuando, texto)
+# LOG DE TEXTO (SOLO PARA PRUEBAS)  -  fin del bloque
+# ---------------------------------------------------------------------------
+
+
 _aviso_stt_emitido = False
 
 
@@ -367,6 +389,11 @@ def _avisar_modo_stt() -> None:
         logger.info("STT activo: %s", STT_MODE)
     else:
         logger.error("VISHGUARD_STT desconocido: %s (usa simulado, whisper, gemini o groq)", STT_MODE)
+    if _log_texto_activo():  # LOG DE TEXTO (SOLO PRUEBAS)
+        logger.warning(
+            "VISHGUARD_LOG_TEXTO activo: lo que dicen las personas se imprime en el log. "
+            "Úsalo solo en pruebas y desactívalo después."
+        )
 
 
 def transcribir_audio(pcm8k: bytes) -> str:
@@ -438,6 +465,7 @@ async def _procesar_chunk(
             texto = await asyncio.to_thread(transcribir_audio, pcm)
             if not texto:
                 return
+            _log_texto_prueba(hablante, texto, inicio_ms)  # LOG DE TEXTO (SOLO PRUEBAS)
 
             # ETAPA 2: análisis de fraude.
             resultado = await _etapa_analisis(texto)

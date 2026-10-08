@@ -1858,6 +1858,90 @@ def test_two_simultaneous_calls_without_callsid_leave_two_recordings(client, fak
 
 
 # ============================================================================
+# LOG DE TEXTO (SOLO PRUEBAS)  -  inicio del bloque
+# Cubre VISHGUARD_LOG_TEXTO. Si eliminas esa función de twilio_stream.py,
+# borra también este bloque entero (hasta la marca "fin del bloque").
+# ============================================================================
+
+
+def _mensajes_de_texto(caplog) -> List[str]:
+    return [r.getMessage() for r in caplog.records if "[TEXTO]" in r.getMessage()]
+
+
+def _llamada_con_dos_hablantes(client) -> None:
+    with client.websocket_connect(TWILIO_WS) as ws:
+        ws.send_json(ev_start())
+        send_conversacion(ws, FRAMES_3S, ini_llamante=100, ini_receptor=220)
+        finish_call(ws)
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+@pytest.mark.security
+def test_text_log_is_off_by_default(client, fakes, fake_manager, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delenv("VISHGUARD_LOG_TEXTO", raising=False)
+    fakes.stt.clasificar = quien_habla
+    with caplog.at_level(logging.INFO, logger="vishguard.twilio"):
+        _llamada_con_dos_hablantes(client)
+
+    assert len(fake_manager.sent) == 2                     # la llamada se procesó igual
+    assert _mensajes_de_texto(caplog) == []                # pero nada de lo dicho llegó al log
+    assert "habla el llamante" not in caplog.text and "habla el receptor" not in caplog.text
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_text_log_prints_who_said_what_when_enabled(client, fakes, fake_manager, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("VISHGUARD_LOG_TEXTO", "1")
+    fakes.stt.clasificar = quien_habla
+    with caplog.at_level(logging.INFO, logger="vishguard.twilio"):
+        _llamada_con_dos_hablantes(client)
+
+    assert sorted(_mensajes_de_texto(caplog)) == [
+        "[TEXTO] llamante @ 0.1 s: habla el llamante",
+        "[TEXTO] receptor @ 0.2 s: habla el receptor",
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.websocket
+def test_text_log_does_not_print_empty_transcriptions(client, fakes, fake_manager, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("VISHGUARD_LOG_TEXTO", "1")
+    fakes.stt.behaviors[0] = ""
+    with caplog.at_level(logging.INFO, logger="vishguard.twilio"):
+        with client.websocket_connect(TWILIO_WS) as ws:
+            ws.send_json(ev_start())
+            send_audio(ws, FRAMES_3S)
+            finish_call(ws)
+
+    assert _mensajes_de_texto(caplog) == []
+
+
+@pytest.mark.unit
+@pytest.mark.security
+def test_text_log_warns_once_that_it_is_active(monkeypatch, twilio_stream_mod, caplog):
+    import logging
+
+    monkeypatch.setenv("VISHGUARD_LOG_TEXTO", "1")
+    monkeypatch.setattr(twilio_stream_mod, "_aviso_stt_emitido", False)
+    with caplog.at_level(logging.WARNING, logger="vishguard.twilio"):
+        twilio_stream_mod._avisar_modo_stt()
+        twilio_stream_mod._avisar_modo_stt()
+
+    assert len([r for r in caplog.records if "VISHGUARD_LOG_TEXTO" in r.getMessage()]) == 1
+
+
+# LOG DE TEXTO (SOLO PRUEBAS)  -  fin del bloque
+# ============================================================================
+
+
+# ============================================================================
 # SMOKE TEST CON LA APP REAL
 # ============================================================================
 
