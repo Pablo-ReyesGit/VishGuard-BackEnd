@@ -11,7 +11,7 @@ websockets==16.1.1            # WebSockets (uvicorn) y scripts de prueba
 # --- Modelos, base de datos y configuración ---
 pydantic==2.13.5
 pydantic-settings==2.15.0
-sqlmodel==0.0.42
+sqlmodel==0.0.42    
 psycopg[binary]==3.3.6        # PostgreSQL (Neon)
 python-dotenv==1.2.3
 

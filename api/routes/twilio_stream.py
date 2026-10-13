@@ -33,6 +33,15 @@
 #   VISHGUARD_WAV_DIR      carpeta de las grabaciones (defecto: grabaciones)
 #   VISHGUARD_WAV_MAX_SEG  tope de segundos grabados por llamada y por pista (defecto: 600)
 #   VISHGUARD_WAV_MODO     estereo (defecto: izq=llamante, der=receptor) | mono (mezcla)
+#   --- [S1-2] límites de ingesta (T3/T9) ---
+#   VISHGUARD_WAV_TTL_HORAS   las grabaciones más viejas se borran al iniciar otra (defecto: 24)
+#   VISHGUARD_MAX_LLAMADAS    llamadas simultáneas aceptadas en /ws/twilio (defecto: 20)
+#   VISHGUARD_MAX_FRAME_BYTES tamaño máximo de una trama mu-law (Twilio envía 160) (defecto: 4096)
+#   VISHGUARD_MAX_SEG_PISTA   segundos máximos de audio por pista y llamada (defecto: 7200)
+#   VISHGUARD_MAX_PENDIENTES  bloques en análisis por pista antes de descartar (defecto: 5)
+#   VISHGUARD_MAX_FRAMES_VENTANA  tramas por 5 s y conexión (Twilio envía ~500) (defecto: 1500)
+#   VISHGUARD_WS_MAX_MENSAJE  tamaño máximo de un evento JSON, en caracteres (defecto: 65536)
+#   VISHGUARD_WS_IDLE_SEG     segundos sin ningún evento antes de cerrar (defecto: 60)
 #
 # PUNTOS DE EXTENSIÓN (de afuera hacia adentro):
 #   * transcribir_audio(pcm8k) -> str   Elige el motor según VISHGUARD_STT (ver arriba).
@@ -48,8 +57,8 @@
 # ==============================================================================
 
 import asyncio
-import base64
-import binascii
+import base64  # noqa: F401  (se mantiene por compatibilidad con pruebas existentes)
+import binascii  # noqa: F401
 import io
 import json
 import logging
@@ -57,6 +66,7 @@ import os
 import re
 import secrets
 import threading
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +90,9 @@ from twilio.twiml.voice_response import Dial, Start, VoiceResponse
 from core.alert_service import guardar_alerta_si_aplica
 from core.connection_manager import manager
 from modules.analyzer import VishingAnalyzer
+from modules.Security.pii_sanitizer import PIISanitizer, SanitizationError          # [S1-2]
+from modules.Security.rate_limit import ConnectionLimiter, TooManyConnections        # [S1-2]
+from modules.resilience.call_session import LimiteExcedido, SesionLlamada            # [S1-2]
 
 logger = logging.getLogger("vishguard.twilio")
 
@@ -106,6 +119,18 @@ HABLANTES = {"inbound": "llamante", "outbound": "receptor"}
 # que no tiene autenticación, recibe un stream interminable).
 WAV_MAX_BYTES = BYTES_POR_SEGUNDO * int(os.getenv("VISHGUARD_WAV_MAX_SEG", "600"))
 
+# --- [S1-2] Límites de ingesta (T3/T9) -----------------------------------------
+WAV_TTL_HORAS = float(os.getenv("VISHGUARD_WAV_TTL_HORAS", "24"))
+MAX_LLAMADAS_SIMULTANEAS = int(os.getenv("VISHGUARD_MAX_LLAMADAS", "20"))
+MAX_FRAME_BYTES = int(os.getenv("VISHGUARD_MAX_FRAME_BYTES", "4096"))
+MAX_SEG_POR_PISTA = int(os.getenv("VISHGUARD_MAX_SEG_PISTA", "7200"))
+MAX_CHUNKS_PENDIENTES = int(os.getenv("VISHGUARD_MAX_PENDIENTES", "5"))
+MAX_FRAMES_VENTANA = int(os.getenv("VISHGUARD_MAX_FRAMES_VENTANA", "1500"))
+WS_MAX_MENSAJE = int(os.getenv("VISHGUARD_WS_MAX_MENSAJE", "65536"))
+WS_IDLE_SEG = float(os.getenv("VISHGUARD_WS_IDLE_SEG", "60"))
+_limite_llamadas = ConnectionLimiter(max_per_user=MAX_LLAMADAS_SIMULTANEAS)
+_sanitizador = PIISanitizer()
+
 # Referencias fuertes a los análisis en curso: asyncio solo guarda referencias
 # débiles a las tareas y podría recolectarlas antes de terminar.
 _TAREAS_ACTIVAS: set[asyncio.Task] = set()
@@ -115,9 +140,29 @@ def _mask(numero: Optional[str]) -> str:
     return f"***{numero[-4:]}" if numero else "?"
 
 
+def _texto_para_alerta(texto: str) -> str:
+    """[S1-2] La alerta (WebSocket a la app + DB) no debe llevar PII: tarjetas, correos,
+    teléfonos, PINs... Si el sanitizador falla se omite el texto (fail-closed)."""
+    try:
+        return _sanitizador.sanitize(texto)
+    except SanitizationError:
+        return ""
+
+
 # ==============================================================================
 # GRABACIÓN OPCIONAL DEL AUDIO (verificación y muestra para el equipo de Whisper)
 # ==============================================================================
+def _purgar_antiguas(carpeta: Path) -> None:
+    """[S1-2] T3: las grabaciones temporales tienen TTL; se purgan las más viejas."""
+    limite = time.time() - WAV_TTL_HORAS * 3600
+    for archivo in carpeta.glob("*.wav"):
+        try:
+            if archivo.stat().st_mtime < limite:
+                archivo.unlink()
+        except OSError:
+            pass
+
+
 class GrabadorWav:
     """Guarda la conversación COMPLETA de UNA llamada como WAV PCM16 de 8 kHz.
 
@@ -142,6 +187,7 @@ class GrabadorWav:
         try:
             carpeta = Path(os.getenv("VISHGUARD_WAV_DIR", "grabaciones"))
             carpeta.mkdir(parents=True, exist_ok=True)
+            _purgar_antiguas(carpeta)  # [S1-2]
             # El callSid llega por un WebSocket sin autenticar: se deja solo
             # [A-Za-z0-9_-] para que no pueda escapar de la carpeta (../).
             seguro = re.sub(r"[^A-Za-z0-9_-]", "", call_sid or "")[:64] or "sin_sid"
@@ -471,7 +517,8 @@ async def _procesar_chunk(
             resultado = await _etapa_analisis(texto)
             # Cada mensaje sale identificado: quién lo dijo, qué dijo y cuándo
             # (milisegundos desde el inicio de la llamada).
-            resultado = {**resultado, "hablante": hablante, "texto": texto}
+            # [S1-2] El texto de la alerta sale SIN PII (se analizó el original).
+            resultado = {**resultado, "hablante": hablante, "texto": _texto_para_alerta(texto)}
             if inicio_ms is not None:
                 resultado["inicio_ms"] = inicio_ms
             logger.info(
@@ -503,23 +550,52 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
     `to` por query string se mantiene solo como respaldo; el valor normal
     llega en el evento `start` (customParameters).
     """
+    try:
+        with _limite_llamadas.hold("twilio"):  # [S1-2] T9: tope de llamadas simultáneas
+            await _atender_llamada(websocket, to)
+    except TooManyConnections:
+        logger.warning("Límite de llamadas simultáneas alcanzado: se rechaza el WebSocket")
+        await websocket.close(code=1013)  # try again later
+
+
+async def _atender_llamada(websocket: WebSocket, to: Optional[str]) -> None:
     await websocket.accept()
     _avisar_modo_stt()
     logger.info("Conexión WebSocket establecida con Twilio")
 
     destino = manager.normalizar(to) or None   # quien RECIBE la llamada
     llamante: Optional[str] = None             # quien LLAMA (si Twilio lo envía)
-    buffers = {pista: bytearray() for pista in HABLANTES}
+    # [S1-2] buffers volátiles + AudioFrameGuard + límites, uno por pista
+    sesion = SesionLlamada(
+        HABLANTES,
+        chunk_bytes=CHUNK_BYTES,
+        bytes_por_segundo=BYTES_POR_SEGUNDO,
+        vad_rms=UMBRAL_SILENCIO_RMS,
+        max_frame_bytes=MAX_FRAME_BYTES,
+        max_segundos_por_pista=MAX_SEG_POR_PISTA,
+        max_pendientes=MAX_CHUNKS_PENDIENTES,
+        frames_por_ventana=MAX_FRAMES_VENTANA,
+    )
     inicios: dict[str, Optional[int]] = {pista: None for pista in HABLANTES}
     # Un lock por hablante: cada uno se procesa en orden, pero sin esperarse entre sí.
     locks = {pista: asyncio.Lock() for pista in HABLANTES}
     tareas: set[asyncio.Task] = set()
     grabador: Optional[GrabadorWav] = None
+    cierre = 1000                              # [S1-2] código con el que se cierra el socket
 
     def lanzar(pista: str):
         """Envía a la canalización lo acumulado de esa pista y la vacía."""
-        pcm = bytes(buffers[pista])
-        buffers[pista].clear()
+        pcm, hubo_voz = sesion.extraer(pista)
+        if not pcm:
+            return
+        # [S1-2] VAD: un bloque sin una sola trama con voz no gasta STT ni IA
+        # (con STT simulado se mantiene el comportamiento original).
+        if STT_MODE != "simulado" and not hubo_voz:
+            return
+        # [S1-2] contrapresión: si el análisis va muy atrasado, se descarta en vez de acumular
+        if not sesion.reservar(pista):
+            logger.warning("Análisis atrasado en la pista %s: se descarta un bloque", pista)
+            return
         tarea = asyncio.create_task(
             _procesar_chunk(pcm, destino, locks[pista], HABLANTES[pista], inicios[pista])
         )
@@ -527,20 +603,40 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
         _TAREAS_ACTIVAS.add(tarea)
         tarea.add_done_callback(tareas.discard)
         tarea.add_done_callback(_TAREAS_ACTIVAS.discard)
+        tarea.add_done_callback(lambda _t, p=pista: sesion.liberar(p))
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            try:
+                # [S1-2] timeout por inactividad: Twilio envía tramas cada 20 ms
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=WS_IDLE_SEG)
+            except asyncio.TimeoutError:
+                logger.warning("Sin eventos de Twilio durante %s s: se cierra la conexión", WS_IDLE_SEG)
+                break
+            if len(raw) > WS_MAX_MENSAJE:  # [S1-2]
+                logger.warning("Evento demasiado grande (%s caracteres): se cierra la conexión", len(raw))
+                cierre = 1009
+                break
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):  # [S1-2] JSON válido pero no es un evento
                 continue
 
             event = data.get("event")
 
             if event == "start":
-                info = data.get("start", {})
-                params = info.get("customParameters") or {}
+                info = data.get("start")
+                info = info if isinstance(info, dict) else {}
+                params = info.get("customParameters")
+                params = params if isinstance(params, dict) else {}
+                # [S1-2] T9: solo se acepta mu-law 8 kHz mono (si Twilio informa el formato)
+                formato = info.get("mediaFormat")
+                if formato is not None and not sesion.formato_valido(formato):
+                    logger.warning("Formato de audio no soportado: se cierra el stream")
+                    cierre = 1003
+                    break
                 destino = manager.normalizar(params.get("to")) or destino
                 llamante = manager.normalizar(params.get("from")) or llamante
                 logger.info(
@@ -555,19 +651,26 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
                 grabador = GrabadorWav(info.get("callSid"))
 
             elif event == "media":
-                media = data.get("media") or {}
+                media = data.get("media")
+                media = media if isinstance(media, dict) else {}
                 payload = media.get("payload")
                 if not payload:
                     continue
                 # Sin campo `track` (stream de una sola pista) se asume "inbound".
                 pista = media.get("track") or "inbound"
-                if pista not in HABLANTES:
+                if not isinstance(pista, str) or pista not in HABLANTES:
                     continue
+                # [S1-2] AudioFrameGuard: base64, tamaño, ritmo y duración; VAD por trama
                 try:
-                    raw_mulaw = base64.b64decode(payload, validate=True)
-                except (binascii.Error, ValueError):
-                    logger.warning("Payload base64 inválido: se descarta el frame")
+                    trama = sesion.ingresar(pista, payload)
+                except LimiteExcedido as exc:
+                    logger.warning("Ingesta rechazada: %s", exc.motivo)
+                    cierre = 1008
+                    break
+                if trama is None:
+                    logger.warning("Trama inválida: se descarta el frame")
                     continue
+                raw_mulaw, hay_voz = trama
                 # mu-law 8 kHz -> PCM lineal 16 bit
                 pcm16 = audioop.ulaw2lin(raw_mulaw, 2)
                 ts_ms = _a_int(media.get("timestamp"))
@@ -575,16 +678,21 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
                     grabador = GrabadorWav(None)
                 grabador.escribir(pista, pcm16, ts_ms)
 
-                if not buffers[pista]:
+                if sesion.vacio(pista):
                     inicios[pista] = ts_ms  # instante del primer frame del bloque
-                buffers[pista].extend(pcm16)
-                if len(buffers[pista]) >= CHUNK_BYTES:
+                try:
+                    sesion.agregar(pista, pcm16, hay_voz)
+                except LimiteExcedido as exc:
+                    logger.warning("Ingesta rechazada: %s", exc.motivo)
+                    cierre = 1008
+                    break
+                if sesion.bloque_listo(pista):
                     lanzar(pista)
 
             elif event == "stop":
                 logger.info("Transmisión finalizada por Twilio")
                 for pista in HABLANTES:  # remanente de cada hablante
-                    if len(buffers[pista]) >= MIN_REMANENTE_BYTES:
+                    if sesion.tamano(pista) >= MIN_REMANENTE_BYTES:
                         lanzar(pista)
                 break
 
@@ -598,13 +706,14 @@ async def twilio_websocket_endpoint(websocket: WebSocket, to: Optional[str] = No
         # Cierra el WAV primero: queda completo aunque el análisis tarde.
         if grabador is not None:
             grabador.cerrar()
+        sesion.cerrar()  # [S1-2] T3: los buffers de audio se ponen a cero y se liberan
         # Deja terminar los análisis pendientes (incluye el remanente).
         # shield: si el servidor cancela este handler por una desconexión
         # abrupta, los análisis NO se cancelan y terminan en segundo plano.
         if tareas:
             await asyncio.shield(asyncio.gather(*tareas, return_exceptions=True))
         try:
-            await websocket.close()
+            await websocket.close(code=cierre)
         except Exception:
             pass
 
