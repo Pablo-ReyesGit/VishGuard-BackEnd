@@ -1,0 +1,10 @@
+pydantic>=2
+pydantic-settings>=2
+argon2-cffi>=23
+google-genai
+python-dotenv
+fastapi
+httpx
+pytest
+pytest-cov
+bandit

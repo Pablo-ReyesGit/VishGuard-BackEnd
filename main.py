@@ -1,19 +1,33 @@
-import json
-from typing import List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+load_dotenv()  # DEBE IR PRIMERO que las importaciones de api.routes
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from modules.analyzer import VishingAnalyzer
-from database import init_db, SessionLocal, AlertHistory
+from sqlmodel import SQLModel
 
-# Inicializar Base de Datos SQLite
-init_db()
+from database import engine, init_db
+from api.routes import health, alerts, stream, analysis, twilio_stream, login, users
 
+# Importante: importar modelos para que SQLModel registre la tabla 'User'
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Inicializa y crea todas las tablas en Neon/Postgres al arrancar
+    init_db()
+    yield
+
+
+# Instanciación ÚNICA pasando el lifespan
 app = FastAPI(
-    title="VishGuard AI Backend",
-    description="Engine de ciberseguridad en tiempo real",
-    version="1.0.0"
+    title="VishGuard AI - Calibrated Detection Engine",
+    lifespan=lifespan
 )
 
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,16 +36,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-analyzer = VishingAnalyzer()
+# Inclusión de routers
+app.include_router(health.router)
+app.include_router(alerts.router)
+app.include_router(stream.router)
+app.include_router(analysis.router)
+app.include_router(twilio_stream.router)
+app.include_router(login.router, prefix="/api/v1", tags=["auth"])
+app.include_router(users.router, prefix="/api/v1", tags=["users"])
 
-# Gestor de conexiones para retransmitir (Broadcast)
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
+if __name__ == "__main__":
+    import uvicorn
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:

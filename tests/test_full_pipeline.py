@@ -9,10 +9,14 @@ from modules.analyzer import VishingAnalyzer
 def probar_pipeline_completo():
     print("==================================================")
 <<<<<<< HEAD
+<<<<<<< HEAD
     print(" 🛡️ INTEGRACIÓN STT + GEMINI FLASH (VISHGUARD AI)")
 =======
     print("  (VISHGUARD AI)")
 >>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
+=======
+    print("  (VISHGUARD AI)")
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
     print("==================================================\n")
 
     # 1. Inicializar Módulos
@@ -24,10 +28,14 @@ def probar_pipeline_completo():
     audio_simulado = "Estimado cliente, su cuenta bancaria ha sido bloqueada. Por favor dicte el código de confirmación que le enviamos por SMS."
     
 <<<<<<< HEAD
+<<<<<<< HEAD
     print(f"📥 Entrada de Audio (Simulado/Transcrito): \"{audio_simulado}\"\n")
 =======
     print(f"Entrada de Audio (Simulado/Transcrito): \"{audio_simulado}\"\n")
 >>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
+=======
+    print(f"Entrada de Audio (Simulado/Transcrito): \"{audio_simulado}\"\n")
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
     
     # 3. Analizar con Gemini Flash
     print("🔍 Analizando intención con Gemini Flash...")
@@ -35,10 +43,14 @@ def probar_pipeline_completo():
 
     # 4. Resultados visuales de alerta
 <<<<<<< HEAD
+<<<<<<< HEAD
     print("\n🚨 RESULTADO DE LA EVALUACIÓN:")
 =======
     print("\n RESULTADO DE LA EVALUACIÓN:")
 >>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
+=======
+    print("\n RESULTADO DE LA EVALUACIÓN:")
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
     print(f"• Nivel de Riesgo : {resultado['nivel_riesgo']}")
     print(f"• Probabilidad    : {resultado['score']}%")
     print(f"• Patrones        : {', '.join(resultado['patrones_detectados'])}")

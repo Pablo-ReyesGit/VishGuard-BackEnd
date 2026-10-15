@@ -31,6 +31,7 @@ def ejecutar_pruebas():
 
     for caso in casos_de_prueba:
 <<<<<<< HEAD
+<<<<<<< HEAD
         print(f"📌 Probando: {caso['id']}")
         print(f"💬 Texto: \"{caso['texto']}\"")
         
@@ -45,6 +46,14 @@ def ejecutar_pruebas():
         
         print(" Respuesta JSON devuelta por Gemini Flash:")
 >>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
+=======
+        print(f" Probando: {caso['id']}")
+        print(f" Texto: \"{caso['texto']}\"")
+        
+        resultado = analyzer.analizar_texto(caso['texto'])
+        
+        print(" Respuesta JSON devuelta por Gemini Flash:")
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
         print(json.dumps(resultado, indent=4, ensure_ascii=False))
         print("-" * 50 + "\n")
 
