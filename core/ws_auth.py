@@ -10,9 +10,10 @@ from core.config import settings
 from database import engine
 from models.user import User
 from schemas.token import TokenPayload
+from core.phone import normalize_phone
 
 
-def usuario_id_desde_token(token: Optional[str]) -> Optional[int]:
+def usuario_id_desde_token(token: Optional[str], numero: Optional[str] = None) -> Optional[int]:
     """Valida un JWT (misma lógica que deps.get_current_user) y devuelve el
     id del usuario activo, o None si el token no sirve.
 
@@ -35,4 +36,11 @@ def usuario_id_desde_token(token: Optional[str]) -> Optional[int]:
         user = session.get(User, int(data.sub))
         if user is None or not user.is_active:
             return None
+        if numero is not None:
+            try:
+                phone = normalize_phone(numero)
+            except ValueError:
+                return None
+            if user.phone_number != phone:
+                return None
         return user.id

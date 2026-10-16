@@ -1,4 +1,5 @@
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from core.phone import PhoneNumber
 
 
 # Propiedades compartidas por todas las representaciones de usuario
@@ -15,6 +16,7 @@ class UserBase(BaseModel):
     is_active: bool = True
     is_superuser: bool = False
     full_name: str | None = None
+    phone_number: PhoneNumber | None = None
 
 
 # Creación por parte de un administrador/superusuario (puede fijar is_superuser)
@@ -27,6 +29,7 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     full_name: str | None = None
+    phone_number: PhoneNumber | None = None
 
 
 # Actualización por parte de un admin, todos los campos opcionales
@@ -35,6 +38,7 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
     is_superuser: bool | None = None
     full_name: str | None = None
+    phone_number: PhoneNumber | None = None
     password: str | None = Field(default=None, min_length=8, max_length=128)
 
 
@@ -43,6 +47,7 @@ class UserUpdate(BaseModel):
 class UserUpdateMe(BaseModel):
     full_name: str | None = None
     email: EmailStr | None = None
+    phone_number: PhoneNumber | None = None
 
 
 # Cambio de contraseña propio (requiere confirmar la actual)

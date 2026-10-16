@@ -535,7 +535,9 @@ async def _procesar_chunk(
             # ETAPA 4: persistencia. Con STT simulado NO se guarda en la DB
             # (evita alertas falsas).
             if STT_MODE != "simulado":
-                await asyncio.to_thread(guardar_alerta_si_aplica, resultado)
+                await asyncio.to_thread(
+                    guardar_alerta_si_aplica, resultado, numero_destino=destino
+                )
         except Exception:
             logger.exception("Error procesando chunk de audio")
 
