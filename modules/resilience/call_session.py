@@ -22,13 +22,16 @@ class SesionLlamada:
 
     def __init__(self, pistas, chunk_bytes: int, bytes_por_segundo: int = 16000, vad_rms: float = 150.0,
                  max_frame_bytes: int = 4096, max_segundos_por_pista: int = 7200, max_pendientes: int = 5,
-                 frames_por_ventana: int = 1500, ventana_seg: float = 5.0, sample_rate: int = 8000):
+                 frames_por_ventana: int = 1500, ventana_seg: float = 5.0, sample_rate: int = 8000,
+                 min_tramas_voz: int = 10):
         self.max_segundos, self.max_pendientes = max_segundos_por_pista, max_pendientes
         self._sr = sample_rate
         self._guard = {p: AudioFrameGuard(sample_rate, max_frame_bytes, vad_rms_threshold=vad_rms) for p in pistas}
         # 1 s de margen sobre el bloque: el bloque se extrae apenas se completa
         self._buf = {p: VolatileAudioBuffer(chunk_bytes / bytes_por_segundo + 1, bytes_por_segundo) for p in pistas}
         self._chunk = chunk_bytes
+        self._bps = bytes_por_segundo
+        self.min_tramas_voz = min_tramas_voz   # 10 tramas de 20 ms = 0.2 s de voz
         self._voz = {p: 0 for p in pistas}
         self._mulaw = {p: 0 for p in pistas}
         self._pend = {p: 0 for p in pistas}
@@ -80,7 +83,12 @@ class SesionLlamada:
         """Saca TODO lo acumulado de la pista -> (pcm, hubo_voz). El buffer queda vacío y a cero."""
         n = len(self._buf[pista])
         pcm = self._buf[pista].take(n) if n else b""
-        con_voz, self._voz[pista] = self._voz[pista] > 0, 0
+        # Voz sostenida: antes bastaba UNA trama sobre el umbral, así que el ruido de línea
+        # hacía pasar casi todos los bloques por Whisper. Ahora hacen falta ~0.2 s de voz
+        # (o el 20 % del bloque si es un remanente corto).
+        tramas = n / (self._bps * 0.02) if self._bps else 0
+        necesarias = max(1, min(self.min_tramas_voz, int(tramas * 0.2)))
+        con_voz, self._voz[pista] = self._voz[pista] >= necesarias, 0
         return pcm, con_voz
 
     # --- análisis pendientes (contrapresión) ------------------------------------------

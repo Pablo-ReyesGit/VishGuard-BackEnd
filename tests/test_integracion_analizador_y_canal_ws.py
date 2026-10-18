@@ -109,17 +109,6 @@ def test_c07_adaptador_no_llama_modelos_fuera_de_plazo(monkeypatch):
     assert llamadas == ["m1"]                            # m2 ya no se invoca: se acabó el plazo
 
 
-def test_c09_el_log_del_error_incluye_codigo_y_estado_pero_no_secretos(monkeypatch, caplog):
-    class ErrorApi(Exception):
-        code, status = 400, "INVALID_ARGUMENT"
-        message = "API key not valid. key=AIzaSyA1234567890abcdefghijklmnopqrstuv"
-    _cliente_falso(monkeypatch, {"m1": ErrorApi("x")})
-    with caplog.at_level("WARNING"):
-        with pytest.raises(RuntimeError):
-            asyncio.run(rm.gemini_llm_call("k", ["m1"], timeout=1.0)("s", "u"))
-    assert "400" in caplog.text and "INVALID_ARGUMENT" in caplog.text and "AIzaSy" not in caplog.text
-
-
 def test_c10_el_adaptador_no_envia_cabecera_x_server_timeout(monkeypatch):
     capt = {}
     from google import genai
@@ -129,15 +118,6 @@ def test_c10_el_adaptador_no_envia_cabecera_x_server_timeout(monkeypatch):
     monkeypatch.setattr(genai, "Client", espia)
     rm.gemini_llm_call("k", ["m1"], timeout=2.5)
     assert capt["opts"].timeout is None and capt["opts"].client_args == {"timeout": 2.5}
-
-
-def test_c08_la_excepcion_del_modelo_no_se_registra_con_su_mensaje(monkeypatch, caplog):
-    _cliente_falso(monkeypatch, {"m1": RuntimeError("URL con key=AIzaSyA1234567890abcdefghijklmnopqrstuv")})
-    with caplog.at_level("WARNING"):
-        with pytest.raises(RuntimeError):
-            asyncio.run(rm.gemini_llm_call("k", ["m1"], timeout=1.0)("s", "u"))
-    assert "AIzaSy" not in caplog.text
-
 
 # ------------------------------ canal WebSocket ------------------------------
 

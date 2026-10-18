@@ -58,7 +58,7 @@
 
 import asyncio
 import base64  # noqa: F401  (se mantiene por compatibilidad con pruebas existentes)
-import binascii  # noqa: F401
+import binascii  # noqa: F401   x   
 import io
 import json
 import logging
@@ -507,6 +507,9 @@ async def _procesar_chunk(
     """
     async with lock:
         try:
+            t0 = time.perf_counter()
+            texto = await asyncio.to_thread(transcribir_audio, pcm)
+            t_stt = time.perf_counter() - t0
             # ETAPA 1: transcripción (entrega del equipo de Whisper).
             texto = await asyncio.to_thread(transcribir_audio, pcm)
             if not texto:
@@ -536,6 +539,10 @@ async def _procesar_chunk(
             # (evita alertas falsas).
             if STT_MODE != "simulado":
                 await asyncio.to_thread(guardar_alerta_si_aplica, resultado)
+            t1 = time.perf_counter()
+            resultado = await _etapa_analisis(texto)
+            t_llm = time.perf_counter() - t1
+            logger.info("[TIEMPOS] %s stt=%.1fs llm=%.1fs audio=%.1fs", hablante, t_stt, t_llm, len(pcm)/BYTES_POR_SEGUNDO)
         except Exception:
             logger.exception("Error procesando chunk de audio")
 

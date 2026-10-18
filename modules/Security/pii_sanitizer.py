@@ -20,7 +20,10 @@ _DW = "|".join(_DIGIT_WORDS)
 # Orden importa: lo más específico primero.
 _RE_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _RE_IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?:[ \-]?[A-Z0-9]{4}){2,7}(?:[ \-]?[A-Z0-9]{1,4})?\b")
-_RE_CARD = re.compile(r"(?<!\d)\d(?:[ \-]?\d){12,18}(?!\d)")
+_SEP = r"[\s,.\-]{0,2}"
+_RE_CARD     = re.compile(rf"(?<!\d)\d(?:{_SEP}\d){{12,18}}(?!\d)")
+_RE_NUMS     = re.compile(rf"(?<!\d)\d(?:{_SEP}\d){{6,}}(?!\d)")
+_RE_RESIDUAL = re.compile(rf"(?<!\d)\d(?:{_SEP}\d){{8,}}|[\w.+-]+@[\w-]+\.\w+")
 _RE_SECRET = re.compile(
     r"(?i)\b(pin|nip|cvv|cvc|clave|contrase[nñ]a|c[oó]digo|token)\b([^\d\n]{0,25})(\d[\d \-]{2,9}\d|\d{3,10})"
 )
