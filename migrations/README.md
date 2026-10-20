@@ -7,6 +7,11 @@ del número mediante SMS: para las pruebas, registrar solo teléfonos propios.
 
 ## Base de datos
 
+- El 16 de octubre de 2026 se aplicó `003_simulation_alerts.sql`. Agrega
+  `alerta.es_simulacion BOOLEAN NOT NULL DEFAULT FALSE`. Los registros previos
+  conservan el valor falso; las nuevas simulaciones se identifican con verdadero.
+  Se comprobó un INSERT y su lectura en Neon dentro de una transacción revertida,
+  sin dejar un registro técnico de prueba.
 - El 15 de octubre de 2026 se aplicó `002_sqlmodel_schema.sql` a la base configurada
   en `.env`, después de comprobar que las cinco tablas anteriores estaban vacías.
   Se crearon `user` (incluido `phone_number`) y la nueva `alerta`. La tabla de alertas
@@ -46,3 +51,15 @@ del número mediante SMS: para las pruebas, registrar solo teléfonos propios.
 Si `WS_AUTH_REQUIRED=true`, la app debe enviar el JWT a `/ws/stream` y el número
 de la suscripción debe coincidir con el teléfono de su perfil. El comportamiento
 de pruebas sin esa opción sigue permitiendo suscripciones sin autenticación.
+
+## Guardar simulaciones de texto
+
+`POST /analizar-llamada` ahora requiere `Authorization: Bearer <token>` y un
+JSON con `texto`. La cuenta se obtiene del JWT, nunca de un ID enviado por el
+cliente. Cada simulación válida se guarda en `alerta`, incluso las de riesgo bajo,
+con `es_simulacion=true`. El texto vacío se rechaza.
+
+La respuesta contiene la evaluación, `alerta_guardada=true` y `alerta_id` después
+del commit. Un fallo al escribir devuelve HTTP 503 y revierte la transacción.
+`GET /alerts` permite verificar el registro únicamente desde la cuenta propietaria.
+Las alertas de llamadas conservan `es_simulacion=false` y su filtro de riesgo.

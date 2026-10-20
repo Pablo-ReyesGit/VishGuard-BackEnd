@@ -11,14 +11,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine, select
 from sqlmodel.pool import StaticPool
+from sqlalchemy.exc import OperationalError
 
 with patch.dict(os.environ, {
     "DATABASE_URL": "sqlite://",
     "SECRET_KEY": "isolated-phone-tests-secret-key-123456789",
     "FIRST_SUPERUSER_PASSWORD": "isolated-admin-password",
+    "GEMINI_API_KEY": "",
 }):
     from api.deps import get_current_user, get_db
-    from api.routes import alerts, users
+    from api.routes import alerts, analysis, login, users
     from core import alert_service, security, ws_auth
     from models.alert import Alerta
     from models.user import User
@@ -40,7 +42,9 @@ class PhoneAlertTests(unittest.TestCase):
         self.session.refresh(self.other)
         self.app = FastAPI()
         self.app.include_router(users.router, prefix="/api/v1")
+        self.app.include_router(login.router, prefix="/api/v1")
         self.app.include_router(alerts.router)
+        self.app.include_router(analysis.router)
         self.app.dependency_overrides[get_db] = lambda: self.session
         self.app.dependency_overrides[get_current_user] = lambda: self.owner
         self.client = TestClient(self.app)
@@ -92,6 +96,7 @@ class PhoneAlertTests(unittest.TestCase):
         row = self.session.exec(select(Alerta)).one()
         self.assertEqual(row.usuario_id, self.other.id)
         self.assertEqual(row.score, 80)
+        self.assertFalse(row.es_simulacion)
         self.assertEqual(self.client.get("/alerts").json(), [])
         self.app.dependency_overrides[get_current_user] = lambda: self.other
         self.assertEqual(len(self.client.get("/alerts").json()), 1)
@@ -116,6 +121,101 @@ class PhoneAlertTests(unittest.TestCase):
         self.assertEqual(ws_auth.usuario_id_desde_token(token, "+502 2222 2222"), self.other.id)
         self.assertIsNone(ws_auth.usuario_id_desde_token(token, "+50299999999"))
         self.assertIsNone(ws_auth.usuario_id_desde_token("invalid", self.other.phone_number))
+
+    def test_signup_login_profile_and_history_using_real_token(self):
+        self.app.dependency_overrides.pop(get_current_user)
+        payload = {"email": "android@example.com", "password": "android-test-123",
+                   "phone_number": "+50244444444"}
+        self.assertEqual(self.client.post("/api/v1/users/signup", json=payload).status_code, 200)
+        result = self.client.post("/api/v1/login/access-token", data={
+            "username": payload["email"], "password": payload["password"]
+        })
+        self.assertEqual(result.status_code, 200)
+        headers = {"Authorization": "Bearer " + result.json()["access_token"]}
+        profile = self.client.get("/api/v1/users/me", headers=headers)
+        self.assertEqual(profile.json()["phone_number"], payload["phone_number"])
+        self.assertTrue(self.risky(payload["phone_number"]))
+        self.assertTrue(self.risky(self.other.phone_number))
+        history = self.client.get("/alerts", headers=headers)
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(len(history.json()), 1)
+        self.assertEqual(history.json()[0]["usuario_id"], profile.json()["id"])
+        self.assertEqual(self.client.get("/alerts").status_code, 401)
+
+    def test_current_analyzer_message_and_integer_score_are_preserved(self):
+        self.assertTrue(alert_service.guardar_alerta_si_aplica({
+            "nivel_riesgo": "MEDIO", "score": 1, "mensaje_alerta": "Mensaje del analizador",
+            "texto": "Transcripcion completa"
+        }, numero_destino=self.other.phone_number))
+        row = self.session.exec(select(Alerta)).one()
+        self.assertEqual(row.score, 1)
+        self.assertEqual(row.mensaje_alerta, "Mensaje del analizador")
+
+    def simulation(self, *, level="PELIGROSO", score=95, payload=None, headers=None):
+        evaluation = {
+            "nivel_riesgo": level, "score": score,
+            "mensaje_alerta": "Mensaje de simulacion", "recomendacion": "Verifica la llamada",
+        }
+        with patch.object(analysis.analyzer, "analizar_texto", return_value=evaluation):
+            return self.client.post("/analizar-llamada", json=payload or {"texto": "Frase de prueba"},
+                                    headers=headers)
+
+    def test_simulation_is_saved_with_owner_and_returned_id(self):
+        response = self.simulation()
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["alerta_guardada"])
+        self.assertTrue(data["es_simulacion"])
+        row = self.session.get(Alerta, data["alerta_id"])
+        self.assertEqual(row.usuario_id, self.owner.id)
+        self.assertEqual(row.score, 95)
+        self.assertTrue(row.es_simulacion)
+        self.assertEqual(row.mensaje_alerta, data["mensaje_alerta"])
+
+    def test_safe_simulation_is_also_saved_for_testing(self):
+        self.assertEqual(self.simulation(level="BAJO", score=0).status_code, 200)
+        row = self.session.exec(select(Alerta)).one()
+        self.assertEqual(row.nivel_riesgo, "BAJO")
+        self.assertTrue(row.es_simulacion)
+
+    def test_simulation_requires_login_before_analyzing_or_writing(self):
+        self.app.dependency_overrides.pop(get_current_user)
+        with patch.object(analysis.analyzer, "analizar_texto") as analyze:
+            response = self.client.post("/analizar-llamada", json={"texto": "Frase"})
+        self.assertEqual(response.status_code, 401)
+        analyze.assert_not_called()
+        self.assertEqual(self.session.exec(select(Alerta)).all(), [])
+
+    def test_simulation_cannot_choose_another_user(self):
+        response = self.simulation(payload={"texto": "Frase", "usuario_id": self.other.id})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.session.exec(select(Alerta)).all(), [])
+
+    def test_blank_simulation_does_not_write(self):
+        for phrase in ("", "  "):
+            self.assertEqual(self.simulation(payload={"texto": phrase}).status_code, 422)
+        self.assertEqual(self.session.exec(select(Alerta)).all(), [])
+
+    def test_save_failure_is_reported_and_transaction_rolled_back(self):
+        with patch.object(self.session, "commit", side_effect=OperationalError(
+                "test statement", {}, Exception("test failure"))):
+            response = self.simulation()
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("alerta_guardada", response.json())
+        self.assertEqual(self.session.exec(select(Alerta)).all(), [])
+
+    def test_simulation_with_real_token_only_appears_in_own_history(self):
+        self.app.dependency_overrides.pop(get_current_user)
+        owner_token = security.create_access_token(self.owner.id, timedelta(minutes=5))
+        other_token = security.create_access_token(self.other.id, timedelta(minutes=5))
+        headers = {"Authorization": "Bearer " + owner_token}
+        self.assertEqual(self.simulation(headers=headers).status_code, 200)
+        own = self.client.get("/alerts", headers=headers).json()
+        self.assertEqual(len(own), 1)
+        self.assertTrue(own[0]["es_simulacion"])
+        self.assertEqual(self.client.get("/alerts", headers={
+            "Authorization": "Bearer " + other_token
+        }).json(), [])
 
 
 if __name__ == "__main__":

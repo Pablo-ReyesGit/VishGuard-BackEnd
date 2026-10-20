@@ -12,6 +12,30 @@ logger = logging.getLogger("vishguard.alerts")
 NIVELES_A_GUARDAR = {"PELIGROSO", "FRAUDE", "MEDIO"}
 
 
+def construir_alerta(
+    evaluacion: dict, usuario_id: int, *, es_simulacion: bool = False
+) -> Alerta:
+    """Mapea una evaluación al mismo modelo para llamadas y simulaciones."""
+    try:
+        raw_score = evaluacion.get("score") or 0
+        score = float(raw_score)
+        if isinstance(raw_score, float) and 0 <= score <= 1:
+            score *= 100
+        score = max(0, min(100, round(score)))
+    except (TypeError, ValueError, OverflowError):
+        score = 0
+    mensaje = (evaluacion.get("mensaje_alerta") or evaluacion.get("frase_critica")
+               or evaluacion.get("texto") or "Alerta detectada")
+    return Alerta(
+        usuario_id=usuario_id,
+        nivel_riesgo=str(evaluacion.get("nivel_riesgo")),
+        score=score,
+        mensaje_alerta=str(mensaje),
+        recomendacion=evaluacion.get("recomendacion"),
+        es_simulacion=es_simulacion,
+    )
+
+
 def guardar_alerta_si_aplica(
     evaluacion: dict, usuario_id: int | None = None, *, numero_destino: str | None = None
 ) -> bool:
@@ -21,16 +45,6 @@ def guardar_alerta_si_aplica(
     """
     if evaluacion.get("nivel_riesgo") not in NIVELES_A_GUARDAR:
         return False
-
-    try:
-        score = float(evaluacion.get("score") or 0)
-        if 0 <= score <= 1:
-            score *= 100
-        score = max(0, min(100, round(score)))
-    except (TypeError, ValueError):
-        score = 0
-
-    mensaje = evaluacion.get("frase_critica") or evaluacion.get("texto") or "Alerta detectada"
 
     try:
         with Session(engine) as session:
@@ -49,13 +63,7 @@ def guardar_alerta_si_aplica(
             if user is None or not user.is_active:
                 logger.warning("No se guardó la alerta: no hay una cuenta activa asociada")
                 return False
-            alerta = Alerta(
-                usuario_id=user.id,
-                nivel_riesgo=str(evaluacion.get("nivel_riesgo")),
-                score=score,
-                mensaje_alerta=str(mensaje),
-                recomendacion=evaluacion.get("recomendacion"),
-            )
+            alerta = construir_alerta(evaluacion, user.id)
             session.add(alerta)
             session.commit()
         return True
