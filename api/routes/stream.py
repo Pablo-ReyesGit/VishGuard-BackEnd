@@ -9,16 +9,35 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from core.connection_manager import manager  # SINGLETON compartido (no crear otro)
 from core.ws_auth import usuario_id_desde_token
-from services.stt_service import stt_service
-from services.vishing_analyzer import VishingAnalyzer
+from modules.Security.rate_limit import (
+    ConnectionLimiter,
+    SlidingWindowLimiter,
+    TooManyConnections,
+    client_key,
+)
 
 logger = logging.getLogger("vishguard.stream")
 
 router = APIRouter()
 
+
+def _env_bool(nombre: str) -> bool:
+    return os.getenv(nombre, "false").lower() in ("1", "true", "yes")
+
+
 # Con WS_AUTH_REQUIRED=true la app Android debe conectar con ?token=<JWT>.
 # Por defecto está apagado para no romper la app actual mientras se actualiza.
-WS_AUTH_REQUIRED = os.getenv("WS_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+WS_AUTH_REQUIRED = _env_bool("WS_AUTH_REQUIRED")
+# Detrás de ngrok/proxy la IP del peer es la del proxy; activar SOLO si el proxy es de confianza.
+WS_TRUST_FORWARDED = _env_bool("WS_TRUST_FORWARDED")
+WS_MAX_MSG_CHARS = int(os.getenv("WS_MAX_MSG_CHARS", "256"))       # el cliente solo envía "ping"
+WS_MAX_CONN_POR_DUENIO = int(os.getenv("WS_MAX_CONN_POR_USUARIO", "3"))
+WS_MSG_POR_VENTANA = int(os.getenv("WS_MSG_POR_VENTANA", "30"))    # mensajes por 10 s y por conexión
+
+conn_limiter = ConnectionLimiter(max_per_user=WS_MAX_CONN_POR_DUENIO)
+
+if not WS_AUTH_REQUIRED:
+    logger.warning("WS_AUTH_REQUIRED desactivado: cualquiera puede suscribirse a las alertas de cualquier número")
 
 
 def pcm_a_wav_bytes(
@@ -45,15 +64,34 @@ async def websocket_endpoint(
         if usuario_id is None:
             await websocket.close(code=1008)  # policy violation
             return
+        duenio = f"user:{usuario_id}"
+    else:
+        peer = websocket.client.host if websocket.client else "desconocido"
+        duenio = f"ip:{client_key(dict(websocket.headers), peer, WS_TRUST_FORWARDED)}"
 
     if not manager.normalizar(numero):
         await websocket.close(code=1008)
         return
 
+    try:
+        with conn_limiter.hold(duenio):   # libera siempre, aun con excepciones
+            await _atender(websocket, numero)
+    except TooManyConnections:
+        await websocket.close(code=1008)
+
+
+async def _atender(websocket: WebSocket, numero: str) -> None:
     clave = await manager.connect(websocket, numero)
+    ritmo = SlidingWindowLimiter(WS_MSG_POR_VENTANA, 10.0)
     try:
         while True:
             mensaje = await websocket.receive_text()
+            if len(mensaje) > WS_MAX_MSG_CHARS:
+                await websocket.close(code=1009)  # message too big
+                return
+            if not ritmo.allow("msg"):
+                await websocket.close(code=1008)  # demasiados mensajes
+                return
             if mensaje == "ping":  # keepalive opcional desde la app
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
@@ -63,47 +101,3 @@ async def websocket_endpoint(
     finally:
         # Solo elimina si sigue siendo ESTE socket el registrado
         manager.disconnect(clave, websocket)
-
-
-@router.websocket("/ws/stream-audio")
-async def stream_audio_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("📱 Android conectado al WebSocket de audio.")
-
-    # Instanciar el analizador al momento de aceptar la llamada
-    analyzer = VishingAnalyzer()
-    transcripcion_acumulada = ""
-
-    try:
-        while True:
-            # Recibe el chunk de bytes PCM desde Android
-            audio_bytes_pcm = await websocket.receive_bytes()
-
-            # Convierte el buffer PCM a formato WAV para STT
-            audio_bytes_wav = pcm_a_wav_bytes(audio_bytes_pcm)
-
-            # 1. Transcribe usando los bytes WAV
-            chunk_texto = stt_service.transcribir_audio_bytes(audio_bytes_wav)
-
-            if chunk_texto and chunk_texto.strip():
-                # 2. Acumula el texto a la historia de la llamada
-                transcripcion_acumulada += f" {chunk_texto.strip()}"
-                print(f'🎙️ Texto detectado: "{chunk_texto}" | Acumulado ({len(transcripcion_acumulada)} chars)')
-
-                # 3. La IA analiza con Gemini y evalúa el riesgo
-                analisis_resultado = analyzer.analizar_texto(transcripcion_acumulada)
-
-                # 4. Enviar payload estructurado
-                payload_respuesta = {
-                    "texto_detectado": chunk_texto.strip(),
-                    "transcripcion_completa": transcripcion_acumulada.strip(),
-                    "analisis": analisis_resultado,
-                }
-
-                await websocket.send_json(payload_respuesta)
-
-    except WebSocketDisconnect:
-        print("📱 Llamada finalizada: Cliente Android desconectado.")
-    except Exception as e:
-        print(f"❌ Error en stream: {e}")
-        await websocket.close()
