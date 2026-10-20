@@ -1,33 +1,30 @@
-import datetime
-from sqlmodel import SQLModel, create_engine, Session, Field
-from sqlalchemy.orm import sessionmaker
+import os
 
-# 1. Importa el objeto 'settings' instanciado en core/config.py
-from core.config import settings
+from dotenv import load_dotenv
+from sqlmodel import SQLModel, Session, create_engine
 
-# 2. Accede directamente al atributo DATABASE_URL del objeto 'settings'
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "No se encontró DATABASE_URL. Revisa el archivo .env."
+    )
+
 engine = create_engine(
-    str(settings.DATABASE_URL), 
-    echo=False
+    DATABASE_URL,
+    pool_pre_ping=True,
 )
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-class AlertHistory(SQLModel, table=True):
-    __tablename__: str = "alert_history"
-
-    id: int | None = Field(default=None, primary_key=True)
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    nivel_riesgo: str = Field(index=True, max_length=20)
-    score: int
-    patrones_detectados: str = Field(max_length=255)
-    frase_critica: str
-    recomendacion: str
 
 
 def init_db() -> None:
-    SQLModel.metadata.create_all(bind=engine)
+    """Crea las tablas registradas en los modelos SQLModel."""
+    # Importar los modelos antes de crear las tablas.
+    from models.user import User
+    from models.alert import Alerta
+
+    SQLModel.metadata.create_all(engine)
 
 
 def get_db():

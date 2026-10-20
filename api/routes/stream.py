@@ -42,12 +42,12 @@ async def websocket_endpoint(
     token: Optional[str] = Query(default=None),
 ):
     if WS_AUTH_REQUIRED:
-        usuario_id = await asyncio.to_thread(usuario_id_desde_token, token)
+        usuario_id = await asyncio.to_thread(
+            usuario_id_desde_token, token, manager.normalizar(numero)
+        )
         if usuario_id is None:
             await websocket.close(code=1008)  # policy violation
             return
-        # PENDIENTE (T6, Sprint 3): comprobar que `numero` pertenece a ese usuario
-        # (depende del campo de teléfono en models.user.User).
         duenio = f"user:{usuario_id}"
     else:
         peer = websocket.client.host if websocket.client else "desconocido"

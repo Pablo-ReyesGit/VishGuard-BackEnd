@@ -1,33 +1,34 @@
-from dotenv import load_dotenv
-load_dotenv()  # DEBE IR PRIMERO que las importaciones de api.routes
-
 from contextlib import asynccontextmanager
+import logging
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import SQLModel
 
-from database import engine, init_db
-from api.routes import health, alerts, stream, analysis, twilio_stream, login, users
+# Cargar la configuración antes de importar rutas o servicios.
+load_dotenv()
 
-# Importante: importar modelos para que SQLModel registre la tabla 'User'
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+from database import init_db
+from api.routes import alerts, analysis, health, login, stream, twilio_stream, users
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicializa y crea todas las tablas en Neon/Postgres al arrancar
+    # Crea las tablas que falten al iniciar. No actualiza tablas existentes.
     init_db()
     yield
 
 
-# Instanciación ÚNICA pasando el lifespan
 app = FastAPI(
     title="VishGuard AI - Calibrated Detection Engine",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,7 +37,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inclusión de routers
 app.include_router(health.router)
 app.include_router(alerts.router)
 app.include_router(stream.router)
@@ -45,9 +45,8 @@ app.include_router(twilio_stream.router)
 app.include_router(login.router, prefix="/api/v1", tags=["auth"])
 app.include_router(users.router, prefix="/api/v1", tags=["users"])
 
+
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-    #endpoint ngrok https://dealmaker-sputter-antiviral.ngrok-free.dev

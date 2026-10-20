@@ -1,5 +1,7 @@
 from typing import Any
 
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from core.security import get_password_hash, verify_password
@@ -7,12 +9,23 @@ from models.user import User
 from schemas.user import UserCreate, UserUpdate
 
 
+def commit_user(*, session: Session) -> None:
+    """Responde también ante registros simultáneos del mismo correo/teléfono."""
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=409, detail="El correo o teléfono ya está registrado o los datos no son válidos"
+        ) from exc
+
+
 def create_user(*, session: Session, user_create: UserCreate) -> User:
     db_obj = User.model_validate(
         user_create, update={"hashed_password": get_password_hash(user_create.password)}
     )
     session.add(db_obj)
-    session.commit()
+    commit_user(session=session)
     session.refresh(db_obj)
     return db_obj
 
@@ -26,7 +39,7 @@ def update_user(*, session: Session, db_user: User, user_in: UserUpdate) -> Any:
         extra_data["hashed_password"] = hashed_password
     db_user.sqlmodel_update(user_data, update=extra_data)
     session.add(db_user)
-    session.commit()
+    commit_user(session=session)
     session.refresh(db_user)
     return db_user
 

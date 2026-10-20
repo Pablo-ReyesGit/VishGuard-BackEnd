@@ -77,7 +77,7 @@ def update_user_me(
     user_data = user_in.model_dump(exclude_unset=True)
     current_user.sqlmodel_update(user_data)
     session.add(current_user)
-    session.commit()
+    crud_user.commit_user(session=session)
     session.refresh(current_user)
     return current_user
 
