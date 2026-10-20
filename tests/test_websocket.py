@@ -16,19 +16,9 @@ async def probar_conexion_live():
             ]
 
             for texto in casos:
-<<<<<<< HEAD
-<<<<<<< HEAD
-                print(f"📤 Enviando al servidor: \"{texto}\"")
-=======
-<<<<<<< HEAD
-                print(f"📤 Enviando al servidor: \"{texto}\"")
-=======
-                print(f" Enviando al servidor: \"{texto}\"")
->>>>>>> main
->>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
-=======
-                print(f" Enviando al servidor: \"{texto}\"")
->>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
+
+                print(f"Enviando al servidor: \"{texto}\"")
+
                 await websocket.send(texto)
 
                 # CORRECCIÓN AQUÍ: Usamos .recv() en lugar de .receive()
