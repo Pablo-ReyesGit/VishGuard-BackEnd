@@ -16,11 +16,9 @@ async def probar_conexion_live():
             ]
 
             for texto in casos:
-<<<<<<< HEAD
-                print(f"📤 Enviando al servidor: \"{texto}\"")
-=======
-                print(f" Enviando al servidor: \"{texto}\"")
->>>>>>> main
+
+                print(f"Enviando al servidor: \"{texto}\"")
+
                 await websocket.send(texto)
 
                 # CORRECCIÓN AQUÍ: Usamos .recv() en lugar de .receive()

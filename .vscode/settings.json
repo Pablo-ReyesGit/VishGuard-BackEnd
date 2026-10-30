@@ -1,11 +1,21 @@
 {
 <<<<<<< HEAD
+<<<<<<< HEAD
     "python-envs.defaultEnvManager": "ms-python.python:system"
 =======
+<<<<<<< HEAD
+    "python-envs.defaultEnvManager": "ms-python.python:system"
+=======
+=======
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
     "python.testing.pytestArgs": [
         "."
     ],
     "python.testing.unittestEnabled": false,
     "python.testing.pytestEnabled": true
+<<<<<<< HEAD
 >>>>>>> main
+>>>>>>> b89c59e (feat: integracion de API Gemini funcionando en analyzer)
+=======
+>>>>>>> 197a96a4bb5ec2a5e613e39ec9ba1d1e9d136b06
 }

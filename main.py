@@ -1,15 +1,36 @@
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+import asyncio
+import logging
+
+from dotenv import load_dotenv
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from modules.analyzer import VishingAnalyzer
+
+# Cargar la configuración antes de importar rutas o servicios.
+load_dotenv()
+
 from database import init_db
+from api.routes import alerts, analysis, debug, health, login, stream, twilio_stream, users
 
-# Inicializar Base de Datos
-init_db()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
-app = FastAPI(title="VishGuard AI Backend - Gemini Engine")
 
-# Habilitar CORS para permitir peticiones desde Android
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Crea las tablas que falten al iniciar. No actualiza tablas existentes.
+    init_db()
+    await asyncio.to_thread(twilio_stream.precargar_stt)
+    yield
+
+
+app = FastAPI(
+    title="VishGuard AI - Calibrated Detection Engine",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,32 +39,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Instancia global del analizador con Gemini
-analyzer = VishingAnalyzer()
+app.include_router(health.router)
+app.include_router(alerts.router)
+app.include_router(stream.router)
+app.include_router(analysis.router)
+app.include_router(debug.router)
+app.include_router(twilio_stream.router)
+app.include_router(login.router, prefix="/api/v1", tags=["auth"])
+app.include_router(users.router, prefix="/api/v1", tags=["users"])
 
-class CallRequest(BaseModel):
-    texto: str
-
-@app.get("/")
-def check_health():
-    return {"status": "online", "model": "Gemini 2.5 Flash", "system": "VishGuard AI Engine"}
-
-@app.post("/analizar-llamada")
-def analizar_llamada(data: CallRequest, request: Request):
-    ip_cliente = request.client.host
-    print("\n" + "="*60)
-    print(f"🔌 [PETICIÓN RECIBIDA] Desde: {ip_cliente}")
-    print(f"📥 [TRANSCRIPCIÓN]: \"{data.texto}\"")
-    print("="*60)
-
-    # Inferencia de contexto mediante Gemini
-    resultado = analyzer.analizar_texto(data.texto)
-
-    print(f"📊 [EVALUACIÓN GEMINI]: Riesgo={resultado.get('nivel_riesgo')} | Score={resultado.get('score')}%")
-    print(f"💡 [RECOMENDACIÓN]: {resultado.get('recomendacion')}\n")
-
-    return resultado
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

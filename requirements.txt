@@ -1,3 +1,36 @@
-google-genai>=0.1.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
+# VishGuard backend - dependencias
+# Versiones tomadas del entorno (.venv) donde el backend se probó con Python 3.13.
+# Instalar:  pip install -r requirements.txt
+
+# --- Servidor web y WebSockets ---
+fastapi==0.143.2
+uvicorn==0.54.0
+python-multipart==0.0.32      # request.form() del webhook de Twilio
+websockets==16.1.1            # WebSockets (uvicorn) y scripts de prueba
+
+# --- Modelos, base de datos y configuración ---
+pydantic==2.13.5
+pydantic-settings==2.16.0
+sqlmodel==0.0.48
+psycopg[binary]==3.3.6        # PostgreSQL (Neon)
+python-dotenv==1.2.4
+
+# --- Autenticación ---
+pyjwt==2.15.1
+pwdlib[argon2,bcrypt]==0.3.1
+email-validator==2.3.0
+
+# --- Llamadas (Twilio) y audio ---
+twilio==9.12.0
+audioop-lts==0.2.2; python_version >= "3.13"   # audioop salió de la librería estándar en 3.13
+numpy==2.5.3
+
+# --- Transcripción (STT): se usa el que indique VISHGUARD_STT ---
+faster-whisper==1.2.1         # VISHGUARD_STT=whisper (modelo local)
+google-genai==2.29.0          # VISHGUARD_STT=gemini y analizador
+groq==1.7.0                   # VISHGUARD_STT=groq
+
+# --- Scripts y pruebas ---
+requests==2.34.2
+httpx==0.28.1                 # lo exige TestClient
+pytest==9.1.1

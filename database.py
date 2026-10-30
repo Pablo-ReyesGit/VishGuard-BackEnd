@@ -1,33 +1,41 @@
-import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
-from sqlalchemy.orm import declarative_base, sessionmaker
+import os
 
-# Base de datos SQLite local
-DATABASE_URL = "sqlite:///./vishguard.db"
+from dotenv import load_dotenv
+from sqlalchemy import text
+from sqlmodel import SQLModel, Session, create_engine
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+load_dotenv()
 
-# Modelo de la tabla de alertas
-class AlertHistory(Base):
-    __tablename__ = "alert_history"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-    nivel_riesgo = Column(String(20), index=True)
-    score = Column(Integer)
-    patrones_detectados = Column(String(255))
-    frase_critica = Column(Text)
-    recomendacion = Column(Text)
+if not DATABASE_URL:
+    raise RuntimeError(
+        "No se encontró DATABASE_URL. Revisa el archivo .env."
+    )
 
-# Inicializar tablas en la Base de Datos
-def init_db():
-    Base.metadata.create_all(bind=engine)  # <-- CORREGIDO: create_all en lugar de create_engine
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+
+def init_db() -> None:
+    """Crea las tablas registradas en los modelos SQLModel."""
+    # Importar los modelos antes de crear las tablas.
+    from models.user import User
+    from models.alert import Alerta
+
+    SQLModel.metadata.create_all(engine)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(
+                text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS phone_number VARCHAR;')
+            )
+            conn.execute(
+                text('CREATE UNIQUE INDEX IF NOT EXISTS ix_user_phone_number ON "user" (phone_number);')
+            )
+
 
 def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    with Session(engine) as session:
+        yield session

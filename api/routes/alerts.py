@@ -1,14 +1,18 @@
 from fastapi import APIRouter
-from database import SessionLocal, AlertHistory
+from sqlmodel import col, select
+
+from api.deps import CurrentUser, SessionDep
+from models.alert import Alerta
 
 router = APIRouter()
 
-@router.get("/alerts")
-def get_alert_history():
-    """Endpoint HTTP para consultar el historial."""
-    db = SessionLocal()
-    try:
-        alertas = db.query(AlertHistory).order_by(AlertHistory.timestamp.desc()).all()
-        return alertas
-    finally:
-        db.close()
+
+@router.get("/alerts", response_model=list[Alerta])
+def get_alert_history(session: SessionDep, current_user: CurrentUser) -> list[Alerta]:
+    """Devuelve las alertas del usuario autenticado, de la más reciente a la más antigua."""
+    statement = (
+        select(Alerta)
+        .where(Alerta.usuario_id == current_user.id)
+        .order_by(col(Alerta.fecha_alerta).desc())
+    )
+    return list(session.exec(statement).all())

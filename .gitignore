@@ -17,3 +17,7 @@ app/build/
 local.properties
 .cxx/
 
+grabaciones/
+
+*.db
+*.zip

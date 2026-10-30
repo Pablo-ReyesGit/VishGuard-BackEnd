@@ -1,82 +1,55 @@
-﻿import os
-import json
-import re
-from google import genai
+"""VishingAnalyzer integrado con Sprint 1-2 (reemplaza al analyzer.py original).
+
+Qué cambia frente al original:
+  * T1  el texto se sanitiza (PII, fail-closed) ANTES de salir hacia Gemini
+  * T8  timeout total 2.5 s, transcripción delimitada (anti prompt injection) y esquema validado
+  * T7  piso max(score_LLM, score_heurístico); el nivel sale del score final
+  * sin print(): logging (el LogSanitizer cubre uvicorn; un print() se salta el filtro)
+  * respuesta con el mismo contrato en TODAS las rutas: nivel_riesgo, score, mensaje_alerta, recomendacion
+    (antes la ruta local devolvía patrones_detectados/frase_critica y no mensaje_alerta)
+API: `await analyzer.analizar_texto_async(texto)` (preferida). `analizar_texto(texto)` se mantiene
+síncrona por compatibilidad; bloquea hasta 2.5 s como máximo (antes podía bloquear sin límite).
+"""
+import asyncio
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 from dotenv import load_dotenv
 
-load_dotenv()
+from modules.resilience.resilience_manager import ResilienceManager, gemini_llm_call
+
+log = logging.getLogger("vishguard.analyzer")
+
+MODELOS_POR_DEFECTO = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]
+TIMEOUT_LLM = 2.5
+
 
 class VishingAnalyzer:
+
     def __init__(self):
+        load_dotenv()
         api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            print("⚠️ [ANALYZER]: No se detectó GEMINI_API_KEY en .env")
-            self.client = None
+        modelos = [m.strip() for m in os.getenv("GEMINI_MODELS", "").split(",") if m.strip()] or MODELOS_POR_DEFECTO
+        if api_key:
+            llm_call = gemini_llm_call(api_key, modelos, timeout=TIMEOUT_LLM,
+                                       max_output_tokens=int(os.getenv("GEMINI_MAX_TOKENS", "500")))
         else:
-            self.client = genai.Client(api_key=api_key)
-            print("🔑 [ANALYZER]: Cliente Gemini inicializado con éxito.")
+            llm_call = None
+            log.warning("Sin GEMINI_API_KEY: análisis solo con el motor heurístico local")
+        # Instancia ÚNICA por proceso: el circuit breaker debe compartirse entre llamadas.
+        self.manager = ResilienceManager(llm_call, timeout=TIMEOUT_LLM)
 
-    def analizar_texto(self, texto: str) -> dict:
-        if not self.client:
-            return self._evaluacion_local(texto)
+    async def analizar_texto_async(self, texto: str, contexto: str = "") -> dict:
+        return await self.manager.analizar(texto, contexto=contexto)
 
-        prompt = f"""
-Eres un analista experto en ciberseguridad y detección de vishing y extorsión telefónica.
-Analiza la siguiente frase de una llamada: "{texto}"
-
-Clasificación:
-- BAJO: Saludos o pláticas familiares sin exigencias monetarias ni presiones. Score 0-20.
-- MEDIO: Llamadas comerciales sospechosas, confirmación de datos u ofertas dudosas. Score 35-65.
-- PELIGROSO: Petición urgente de dinero en efectivo, amenazas policiales/cárcel/accidentes o solicitud de claves/CVV/SMS. Score 80-100.
-
-Responde ÚNICAMENTE un JSON válido con esta estructura exacta sin explicaciones adicionales:
-{{"nivel_riesgo": "PELIGROSO", "score": 95, "recomendacion": "..."}}
-"""
-
-        # Modelos habilitados en tu cuenta ordenados por velocidad y menor saturación
-        modelos = [
-            "models/gemini-3.5-flash-lite",
-            "models/gemini-3.5-flash",
-            "models/gemini-3.8-flash"
-        ]
-
-        for mod in modelos:
-            try:
-                # Invocación directa sin esperas
-                response = self.client.models.generate_content(
-                    model=mod,
-                    contents=prompt
-                )
-
-                if response and response.text:
-                    raw_text = response.text.strip()
-                    if "```" in raw_text:
-                        raw_text = re.sub(r"```(json)?", "", raw_text).strip()
-
-                    resultado = json.loads(raw_text)
-                    print(f"✨ [ANÁLISIS EXITOSO DE GEMINI - Modelo: {mod}]")
-                    return resultado
-
-            except Exception as e:
-                print(f"⚠️ {mod} no disponible ({e}). Pasando al siguiente modelo sin demora...")
-                continue
-
-        print("❌ [TODOS LOS MODELOS FALLARON]: Activando contingencia heurística.")
-        return self._evaluacion_local(texto)
-
-    def _evaluacion_local(self, texto: str) -> dict:
-        t = texto.lower()
-        extorsion = any(w in t for w in ["policía", "policia", "accidente", "cárcel", "carcel", "atropellé", "atropelle", "dinero", "secuestro"])
-        bancario = any(w in t for w in ["tarjeta", "sms", "cvv", "nip", "pin", "clave", "código", "token"])
-
-        if extorsion or bancario:
-            return {
-                "nivel_riesgo": "PELIGROSO",
-                "score": 95,
-                "recomendacion": "¡Alerta de Fraude o Extorsión! Mantenga la calma y no entregue dinero ni datos."
-            }
-        return {
-            "nivel_riesgo": "BAJO",
-            "score": 10,
-            "recomendacion": "Llamada sin indicios de riesgo evidente."
-        }
+    def analizar_texto(self, texto: str, contexto: str = "") -> dict:
+        """Compatibilidad con llamadores síncronos (también si hay un event loop activo)."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.manager.analizar(texto, contexto=contexto))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                asyncio.run, self.manager.analizar(texto, contexto=contexto)
+            ).result()
